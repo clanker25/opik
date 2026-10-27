@@ -1,0 +1,416 @@
+from unittest.mock import MagicMock, Mock, patch
+
+import httpx
+import pytest
+
+from opik.configurator.configure import (
+    OPIK_BASE_URL_CLOUD,
+)
+from opik.configurator import opik_rest_helpers
+
+
+class TestIsInstanceActive:
+    @pytest.mark.parametrize(
+        "status_code, body, expected_result",
+        [
+            (200, {"message": "Healthy Server", "healthy": True}, True),
+            # Vite, or Opik's nginx outside /api/: every path is the HTML page.
+            (200, ValueError("Expecting value"), False),
+            (200, ["not", "an", "object"], False),
+            (404, ValueError("Expecting value"), False),
+            (500, {"message": "Not Healthy", "healthy": False}, False),
+        ],
+    )
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_is_instance_active(
+        self, mock_httpx_client, status_code, body, expected_result
+    ):
+        """
+        Only the Opik backend's own healthy answer counts, so a dev server on the
+        same port is not taken for Opik.
+        """
+        mock_client_instance = MagicMock()
+        mock_response = Mock()
+        mock_response.status_code = status_code
+        if isinstance(body, Exception):
+            mock_response.json.side_effect = body
+        else:
+            mock_response.json.return_value = body
+
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        url = "http://example.com"
+        result = opik_rest_helpers.is_instance_active(url)
+
+        assert result == expected_result
+        # Under api/ first, where Opik's nginx serves the backend.
+        assert (
+            mock_client_instance.get.call_args_list[0].kwargs["url"]
+            == "http://example.com/api/is-alive/ping"
+        )
+
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_is_instance_active__backend_run_on_its_own__answers_at_the_root(
+        self, mock_httpx_client
+    ):
+        """`scripts/dev-runner.sh` has `opik configure` pointed at the backend's
+        own port, which has no `/api/` prefix."""
+        not_found = Mock(status_code=404)
+        healthy = Mock(status_code=200)
+        healthy.json.return_value = {"message": "Healthy Server", "healthy": True}
+        mock_client_instance = MagicMock()
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.get.side_effect = [not_found, healthy]
+        mock_httpx_client.return_value = mock_client_instance
+
+        assert opik_rest_helpers.is_instance_active("http://localhost:8080") is True
+        assert [
+            call.kwargs["url"] for call in mock_client_instance.get.call_args_list
+        ] == [
+            "http://localhost:8080/api/is-alive/ping",
+            "http://localhost:8080/is-alive/ping",
+        ]
+
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_is_instance_active_timeout(self, mock_httpx_client):
+        """
+        Test that a connection timeout results in False being returned.
+        """
+        mock_client_instance = MagicMock()
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.side_effect = httpx.ConnectTimeout("timeout")
+
+        mock_httpx_client.return_value = mock_client_instance
+
+        url = "http://example.com"
+        result = opik_rest_helpers.is_instance_active(url)
+
+        assert result is False
+
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_is_instance_active_general_exception(self, mock_httpx_client):
+        """
+        Test that any general exception results in False being returned.
+        """
+        mock_client_instance = MagicMock()
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.side_effect = Exception("Unexpected error")
+
+        mock_httpx_client.return_value = mock_client_instance
+
+        url = "http://example.com"
+        result = opik_rest_helpers.is_instance_active(url)
+
+        assert result is False
+
+
+class TestIsWorkspaceNameCorrect:
+    @pytest.mark.parametrize(
+        "api_key, workspace, workspace_names, expected_result",
+        [
+            ("valid_api_key", "correct_workspace", ["correct_workspace"], True),
+            ("valid_api_key", "incorrect_workspace", ["other_workspace"], False),
+            ("valid_api_key", "empty_workspace", [], False),
+        ],
+    )
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_workspace_valid_api_key(
+        self, mock_httpx_client, api_key, workspace, workspace_names, expected_result
+    ):
+        """
+        Test cases with valid API keys and workspace verification.
+        These tests simulate different workspace existence conditions.
+        """
+        # Mock the HTTP response for valid API key cases
+        mock_client_instance = MagicMock()
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"workspaceNames": workspace_names}
+
+        # Mock the context manager behavior
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        result = opik_rest_helpers.is_workspace_name_correct(
+            api_key=api_key, workspace=workspace, url=OPIK_BASE_URL_CLOUD
+        )
+        assert result == expected_result
+
+    @pytest.mark.parametrize(
+        "status_code, response_text",
+        [(500, "Internal Server Error"), (404, "Not Found"), (403, "Forbidden")],
+    )
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_workspace_non_200_response(
+        self, mock_httpx_client, status_code, response_text
+    ):
+        """
+        Test cases where the API responds with a non-200 status code.
+        These responses should raise a ConnectionError.
+        """
+        # Mock the HTTP response for non-200 status code cases
+        mock_client_instance = MagicMock()
+        mock_response = Mock()
+        mock_response.status_code = status_code
+        mock_response.text = response_text
+
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        api_key = "valid_api_key"
+        workspace = "any_workspace"
+
+        with pytest.raises(ConnectionError):
+            opik_rest_helpers.is_workspace_name_correct(
+                api_key=api_key, workspace=workspace, url=OPIK_BASE_URL_CLOUD
+            )
+
+    @pytest.mark.parametrize(
+        "exception",
+        [
+            (httpx.RequestError("Timeout", request=MagicMock())),
+            (Exception("Unexpected error")),
+        ],
+    )
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_workspace_request_exceptions(self, mock_httpx_client, exception):
+        """
+        Test cases where an exception is raised during the HTTP request.
+        These cases should raise a ConnectionError with the appropriate message.
+        """
+        # Mock the HTTP request to raise an exception
+        mock_client_instance = MagicMock()
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.side_effect = exception
+
+        mock_httpx_client.return_value = mock_client_instance
+
+        api_key = "valid_api_key"
+        workspace = "any_workspace"
+
+        # Check that the appropriate ConnectionError is raised
+        with pytest.raises(ConnectionError):
+            opik_rest_helpers.is_workspace_name_correct(
+                api_key=api_key, workspace=workspace, url=OPIK_BASE_URL_CLOUD
+            )
+
+
+class TestGetMostRecentProjectName:
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_returns_most_recent_project_name(self, mock_httpx_client):
+        mock_client_instance = MagicMock()
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "content": [
+                {"name": "My Onboarding Agent"},
+                {"name": "Default Project"},
+            ]
+        }
+
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        result = opik_rest_helpers.get_most_recent_project_name(
+            api_key="key", workspace="default", api_url="http://localhost:5173/api/"
+        )
+        assert result == "My Onboarding Agent"
+
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_returns_none_when_no_projects(self, mock_httpx_client):
+        mock_client_instance = MagicMock()
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"content": []}
+
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        result = opik_rest_helpers.get_most_recent_project_name(
+            api_key="key", workspace="default", api_url="http://localhost:5173/api/"
+        )
+        assert result is None
+
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_returns_none_on_non_200_response(self, mock_httpx_client):
+        mock_client_instance = MagicMock()
+        mock_response = Mock()
+        mock_response.status_code = 500
+
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        result = opik_rest_helpers.get_most_recent_project_name(
+            api_key="key", workspace="default", api_url="http://localhost:5173/api/"
+        )
+        assert result is None
+
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_returns_none_on_exception(self, mock_httpx_client):
+        mock_client_instance = MagicMock()
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.side_effect = Exception("connection refused")
+        mock_httpx_client.return_value = mock_client_instance
+
+        result = opik_rest_helpers.get_most_recent_project_name(
+            api_key="key", workspace="default", api_url="http://localhost:5173/api/"
+        )
+        assert result is None
+
+
+class TestIsApiKeyCorrect:
+    @pytest.mark.parametrize(
+        "status_code, expected_result",
+        [
+            (200, True),
+            (401, False),
+            (403, False),
+        ],
+    )
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_is_api_key_correct(self, mock_httpx_client, status_code, expected_result):
+        """
+        Test valid, invalid, and forbidden API key scenarios by simulating HTTP status codes.
+        """
+        mock_client_instance = MagicMock()
+        mock_response = Mock()
+        mock_response.status_code = status_code
+
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        api_key = "dummy_api_key"
+        result = opik_rest_helpers.is_api_key_correct(
+            api_key, url="https://some-url.com"
+        )
+
+        assert result == expected_result
+
+    @pytest.mark.parametrize(
+        "status_code, response_text",
+        [(500, "Internal Server Error")],
+    )
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_is_api_key_correct_non_200_response(
+        self, mock_httpx_client, status_code, response_text
+    ):
+        """
+        Test that a non-200, 401, or 403 response raises a ConnectionError.
+        """
+        mock_client_instance = MagicMock()
+        mock_response = Mock()
+        mock_response.status_code = status_code
+        mock_response.text = response_text
+
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.return_value = mock_response
+        mock_httpx_client.return_value = mock_client_instance
+
+        api_key = "dummy_api_key"
+
+        with pytest.raises(ConnectionError):
+            opik_rest_helpers.is_api_key_correct(api_key, url="https://some-url.com")
+
+    @pytest.mark.parametrize(
+        "exception",
+        [
+            (httpx.RequestError("Timeout", request=MagicMock())),
+            (Exception("Unexpected error")),
+        ],
+    )
+    @patch("opik.configurator.opik_rest_helpers.httpx_client.get")
+    def test_is_api_key_correct_exceptions(self, mock_httpx_client, exception):
+        """
+        Test that RequestError and general exceptions are properly raised as ConnectionError.
+        """
+        mock_client_instance = MagicMock()
+        mock_client_instance.__enter__.return_value = mock_client_instance
+        mock_client_instance.__exit__.return_value = False
+        mock_client_instance.get.side_effect = exception
+
+        mock_httpx_client.return_value = mock_client_instance
+
+        api_key = "dummy_api_key"
+
+        with pytest.raises(ConnectionError):
+            opik_rest_helpers.is_api_key_correct(api_key, url="https://some-url.com")
+
+
+class TestListProjects:
+    """Callers only pick wording or a link from it, so it must never raise."""
+
+    @staticmethod
+    def _respond(monkeypatch, response):
+        client = MagicMock()
+        client.__enter__.return_value.get.side_effect = (
+            response if isinstance(response, Exception) else lambda **kw: response
+        )
+        monkeypatch.setattr(
+            opik_rest_helpers, "_get_httpx_client", lambda **kwargs: client
+        )
+
+    def _list(self):
+        return opik_rest_helpers.list_projects(
+            api_key=None,
+            workspace=None,
+            api_url="https://opik/api/",
+            params={},
+            timeout=1.0,
+        )
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            httpx.ConnectError("no route"),
+            httpx.ReadTimeout("too slow"),
+            OSError("closed"),
+        ],
+    )
+    def test_an_unreachable_deployment__answers_none(self, monkeypatch, failure):
+        self._respond(monkeypatch, failure)
+
+        assert self._list() is None
+
+    def test_a_rejected_request__answers_none(self, monkeypatch):
+        self._respond(monkeypatch, httpx.Response(403, json={}))
+
+        assert self._list() is None
+
+    def test_a_body_that_is_not_json__answers_none(self, monkeypatch):
+        self._respond(monkeypatch, httpx.Response(200, text="<html>nope</html>"))
+
+        assert self._list() is None
+
+    @pytest.mark.parametrize("body", [[], {"content": "nope"}, {"content": None}])
+    def test_a_body_of_the_wrong_shape__answers_none(self, monkeypatch, body):
+        self._respond(monkeypatch, httpx.Response(200, json=body))
+
+        assert self._list() is None
+
+    def test_a_listing__keeps_only_project_objects(self, monkeypatch):
+        self._respond(
+            monkeypatch,
+            httpx.Response(200, json={"content": [{"name": "my-app"}, "junk"]}),
+        )
+
+        assert self._list() == [{"name": "my-app"}]

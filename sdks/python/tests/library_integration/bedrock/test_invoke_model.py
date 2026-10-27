@@ -1,0 +1,799 @@
+import json
+import boto3
+import pytest
+
+import opik
+from opik.integrations.bedrock import track_bedrock
+from ... import llm_constants
+from ...testlib import (
+    ANY_BUT_NONE,
+    ANY_DICT,
+    ANY_STRING,
+    SpanModel,
+    TraceModel,
+    assert_equal,
+)
+from .constants import (
+    EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT,
+)
+
+pytestmark = pytest.mark.usefixtures("ensure_aws_bedrock_configured")
+
+
+@pytest.mark.parametrize(
+    "project_name, expected_project_name",
+    [
+        (None, "Default Project"),
+        ("bedrock-integration-test", "bedrock-integration-test"),
+    ],
+)
+def test_bedrock_invoke_model__anthropic___happyflow(
+    fake_backend, project_name, expected_project_name
+):
+    """Test basic invoke_model functionality with Bedrock client."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-1")
+    tracked_client = track_bedrock(client, project_name=project_name)
+
+    # Prepare request body for Claude
+    request_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 50,
+        "temperature": 0.1,
+        "messages": [{"role": "user", "content": "Hello, how are you?"}],
+    }
+
+    response = tracked_client.invoke_model(
+        modelId=llm_constants.BEDROCK_CLAUDE_SONNET,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    response_body = json.loads(response["body"].read())
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model",
+        input={"body": request_body, "modelId": llm_constants.BEDROCK_CLAUDE_SONNET},
+        output={"body": response_body},
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        project_name=expected_project_name,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model",
+                type="llm",
+                input={
+                    "body": request_body,
+                    "modelId": llm_constants.BEDROCK_CLAUDE_SONNET,
+                },
+                output={"body": response_body},
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model=llm_constants.BEDROCK_CLAUDE_SONNET,
+                usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                provider="bedrock",
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+
+    trace_tree = fake_backend.trace_trees[0]
+    assert_equal(expected_trace, trace_tree)
+
+
+def test_bedrock_invoke_model__create_raises_an_error__span_and_trace_finished_gracefully__error_info_is_logged(
+    fake_backend,
+):
+    """Test that errors are properly logged as error spans."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-1")
+    tracked_client = track_bedrock(client)
+
+    request_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 50,
+        "messages": [{"role": "user", "content": "Test message"}],
+    }
+
+    # Use an invalid model to trigger an error
+    with pytest.raises(Exception):
+        tracked_client.invoke_model(
+            modelId="invalid-model-id",
+            body=json.dumps(request_body),
+            contentType="application/json",
+            accept="application/json",
+        )
+
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model",
+        input={"body": request_body, "modelId": "invalid-model-id"},
+        output=None,
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        error_info=ANY_DICT.containing(
+            {
+                "exception_type": ANY_STRING,
+                "message": ANY_STRING,
+                "traceback": ANY_STRING,
+            }
+        ),
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model",
+                type="llm",
+                input={"body": request_body, "modelId": "invalid-model-id"},
+                output=None,
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model="invalid-model-id",
+                provider="bedrock",
+                error_info=ANY_DICT.containing(
+                    {
+                        "exception_type": ANY_STRING,
+                        "message": ANY_STRING,
+                        "traceback": ANY_STRING,
+                    }
+                ),
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+
+    trace_tree = fake_backend.trace_trees[0]
+    assert_equal(expected_trace, trace_tree)
+
+
+def test_bedrock_invoke_model__anthropic___invoke_model_call_made_in_another_tracked_function__bedrock_span_attached_to_existing_trace(
+    fake_backend,
+):
+    """Test that invoke_model calls within tracked functions create proper nesting."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-1")
+    tracked_client = track_bedrock(client)
+
+    @opik.track()
+    def ask_bedrock_question(question: str) -> str:
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": question}],
+        }
+
+        response = tracked_client.invoke_model(
+            modelId=llm_constants.BEDROCK_CLAUDE_SONNET,
+            body=json.dumps(request_body),
+            contentType="application/json",
+            accept="application/json",
+        )
+
+        response_body = json.loads(response["body"].read())
+        return response_body["content"][0]["text"]
+
+    result = ask_bedrock_question("What is 2+2?")
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="ask_bedrock_question",
+        input={"question": "What is 2+2?"},
+        output={"output": result},
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="ask_bedrock_question",
+                input={"question": "What is 2+2?"},
+                output={"output": result},
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                last_updated_at=ANY_BUT_NONE,
+                spans=[
+                    SpanModel(
+                        id=ANY_BUT_NONE,
+                        name="bedrock_invoke_model",
+                        type="llm",
+                        input={
+                            "body": {
+                                "anthropic_version": "bedrock-2023-05-31",
+                                "max_tokens": 50,
+                                "messages": [
+                                    {"role": "user", "content": "What is 2+2?"}
+                                ],
+                            },
+                            "modelId": llm_constants.BEDROCK_CLAUDE_SONNET,
+                        },
+                        output={"body": ANY_DICT},
+                        start_time=ANY_BUT_NONE,
+                        end_time=ANY_BUT_NONE,
+                        tags=["bedrock", "invoke_model"],
+                        metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                        last_updated_at=ANY_BUT_NONE,
+                        model=llm_constants.BEDROCK_CLAUDE_SONNET,
+                        usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                        provider="bedrock",
+                        spans=[],
+                        source="sdk",
+                    )
+                ],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+
+    trace_tree = fake_backend.trace_trees[0]
+    assert_equal(expected_trace, trace_tree)
+
+
+# Test cases for all subproviders
+
+
+def test_bedrock_invoke_model__anthropic___streaming__happyflow(fake_backend):
+    """Test Anthropic Claude streaming invoke_model_with_response_stream."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-2")
+    tracked_client = track_bedrock(client)
+
+    request_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 20,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
+    }
+
+    response = tracked_client.invoke_model_with_response_stream(
+        modelId=llm_constants.BEDROCK_CLAUDE_SONNET,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+
+    # Consume the stream
+    for _ in response["body"]:
+        pass
+
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model_stream",
+        input={"body": request_body, "modelId": llm_constants.BEDROCK_CLAUDE_SONNET},
+        output={"body": ANY_DICT},  # Contains native Claude format
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model_stream",
+                type="llm",
+                input={
+                    "body": request_body,
+                    "modelId": llm_constants.BEDROCK_CLAUDE_SONNET,
+                },
+                output={"body": ANY_DICT},  # Contains native Claude format
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model=llm_constants.BEDROCK_CLAUDE_SONNET,
+                usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                provider="bedrock",
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+    assert_equal(expected_trace, fake_backend.trace_trees[0])
+
+
+def test_bedrock_invoke_model__amazon_nova___non_streaming__happyflow(fake_backend):
+    """Test Amazon Nova non-streaming invoke_model."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-2")
+    tracked_client = track_bedrock(client)
+
+    request_body = {
+        "messages": [{"role": "user", "content": [{"text": "Hello"}]}],
+        "inferenceConfig": {"max_new_tokens": 20},
+    }
+
+    response = tracked_client.invoke_model(
+        modelId=llm_constants.BEDROCK_AMAZON_NOVA,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    response_body = json.loads(response["body"].read())
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model",
+        input={"body": request_body, "modelId": llm_constants.BEDROCK_AMAZON_NOVA},
+        output={"body": response_body},
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model",
+                type="llm",
+                input={
+                    "body": request_body,
+                    "modelId": llm_constants.BEDROCK_AMAZON_NOVA,
+                },
+                output={"body": response_body},
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model=llm_constants.BEDROCK_AMAZON_NOVA,
+                usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                provider="bedrock",
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+    assert_equal(expected_trace, fake_backend.trace_trees[0])
+
+
+def test_bedrock_invoke_model__amazon_nova___streaming__happyflow(fake_backend):
+    """Test Amazon Nova streaming invoke_model_with_response_stream."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-2")
+    tracked_client = track_bedrock(client)
+
+    request_body = {
+        "messages": [{"role": "user", "content": [{"text": "Hello"}]}],
+        "inferenceConfig": {"max_new_tokens": 20},
+    }
+
+    response = tracked_client.invoke_model_with_response_stream(
+        modelId=llm_constants.BEDROCK_AMAZON_NOVA,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+
+    # Consume the stream
+    for _ in response["body"]:
+        pass
+
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model_stream",
+        input={"body": request_body, "modelId": llm_constants.BEDROCK_AMAZON_NOVA},
+        output={"body": ANY_DICT},  # Contains native Nova format
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model_stream",
+                type="llm",
+                input={
+                    "body": request_body,
+                    "modelId": llm_constants.BEDROCK_AMAZON_NOVA,
+                },
+                output={"body": ANY_DICT},  # Contains native Nova format
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model=llm_constants.BEDROCK_AMAZON_NOVA,
+                usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                provider="bedrock",
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+    assert_equal(expected_trace, fake_backend.trace_trees[0])
+
+
+def test_bedrock_invoke_model__meta_llama___non_streaming__happyflow(fake_backend):
+    """Test Meta Llama non-streaming invoke_model."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-2")
+    tracked_client = track_bedrock(client)
+
+    request_body = {
+        "prompt": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        "max_gen_len": 20,
+    }
+
+    response = tracked_client.invoke_model(
+        modelId=llm_constants.BEDROCK_META_LLAMA,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    response_body = json.loads(response["body"].read())
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model",
+        input={"body": request_body, "modelId": llm_constants.BEDROCK_META_LLAMA},
+        output={"body": response_body},
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model",
+                type="llm",
+                input={
+                    "body": request_body,
+                    "modelId": llm_constants.BEDROCK_META_LLAMA,
+                },
+                output={"body": response_body},
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model=llm_constants.BEDROCK_META_LLAMA,
+                usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                provider="bedrock",
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+    assert_equal(expected_trace, fake_backend.trace_trees[0])
+
+
+def test_bedrock_invoke_model__meta_llama___streaming__happyflow(fake_backend):
+    """Test Meta Llama streaming invoke_model_with_response_stream."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-2")
+    tracked_client = track_bedrock(client)
+
+    request_body = {
+        "prompt": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        "max_gen_len": 20,
+    }
+
+    response = tracked_client.invoke_model_with_response_stream(
+        modelId=llm_constants.BEDROCK_META_LLAMA,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+
+    # Consume the stream
+    for _ in response["body"]:
+        pass
+
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model_stream",
+        input={"body": request_body, "modelId": llm_constants.BEDROCK_META_LLAMA},
+        output={"body": ANY_DICT},  # Contains native Llama format
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model_stream",
+                type="llm",
+                input={
+                    "body": request_body,
+                    "modelId": llm_constants.BEDROCK_META_LLAMA,
+                },
+                output={"body": ANY_DICT},  # Contains native Llama format
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model=llm_constants.BEDROCK_META_LLAMA,
+                usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                provider="bedrock",
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+    assert_equal(expected_trace, fake_backend.trace_trees[0])
+
+
+def test_bedrock_invoke_model__mistral___non_streaming__happyflow(fake_backend):
+    """Test Mistral/Pixtral non-streaming invoke_model."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-2")
+    tracked_client = track_bedrock(client)
+
+    request_body = {
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
+        "max_tokens": 20,
+    }
+
+    response = tracked_client.invoke_model(
+        modelId=llm_constants.BEDROCK_MISTRAL_PIXTRAL,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    response_body = json.loads(response["body"].read())
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model",
+        input={"body": request_body, "modelId": llm_constants.BEDROCK_MISTRAL_PIXTRAL},
+        output={"body": response_body},
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model",
+                type="llm",
+                input={
+                    "body": request_body,
+                    "modelId": llm_constants.BEDROCK_MISTRAL_PIXTRAL,
+                },
+                output={"body": response_body},
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model=llm_constants.BEDROCK_MISTRAL_PIXTRAL,
+                usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                provider="bedrock",
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+    assert_equal(expected_trace, fake_backend.trace_trees[0])
+
+
+def test_bedrock_invoke_model__mistral___streaming__happyflow(fake_backend):
+    """Test Mistral/Pixtral streaming invoke_model_with_response_stream."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-2")
+    tracked_client = track_bedrock(client)
+
+    request_body = {
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
+        "max_tokens": 20,
+    }
+
+    response = tracked_client.invoke_model_with_response_stream(
+        modelId=llm_constants.BEDROCK_MISTRAL_PIXTRAL,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+
+    # Consume the stream
+    for _ in response["body"]:
+        pass
+
+    opik.flush_tracker()
+
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model_stream",
+        input={"body": request_body, "modelId": llm_constants.BEDROCK_MISTRAL_PIXTRAL},
+        output={"body": ANY_DICT},  # Contains native Mistral format
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model_stream",
+                type="llm",
+                input={
+                    "body": request_body,
+                    "modelId": llm_constants.BEDROCK_MISTRAL_PIXTRAL,
+                },
+                output={"body": ANY_DICT},  # Contains native Mistral format
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model=llm_constants.BEDROCK_MISTRAL_PIXTRAL,
+                usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                provider="bedrock",
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+    assert_equal(expected_trace, fake_backend.trace_trees[0])
+
+
+def test_bedrock_invoke_model__openai___streaming__happyflow(fake_backend):
+    """Test OpenAI (gpt-oss) streaming invoke_model_with_response_stream."""
+    client = boto3.client("bedrock-runtime", region_name="us-east-2")
+    tracked_client = track_bedrock(client)
+
+    request_body = {
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_completion_tokens": 200,
+    }
+
+    response = tracked_client.invoke_model_with_response_stream(
+        modelId=llm_constants.BEDROCK_OPENAI_GPT_OSS,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+
+    # Consume the stream
+    for _ in response["body"]:
+        pass
+
+    opik.flush_tracker()
+
+    # Native OpenAI chat completion format. ANY_DICT alone would also match the
+    # empty Claude-shaped body these streams got before they had an aggregator.
+    expected_output = {
+        "body": ANY_DICT.containing(
+            {
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ANY_STRING},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+        )
+    }
+    expected_trace = TraceModel(
+        id=ANY_BUT_NONE,
+        name="bedrock_invoke_model_stream",
+        input={"body": request_body, "modelId": llm_constants.BEDROCK_OPENAI_GPT_OSS},
+        output=expected_output,
+        start_time=ANY_BUT_NONE,
+        end_time=ANY_BUT_NONE,
+        tags=["bedrock", "invoke_model"],
+        metadata=ANY_DICT,
+        last_updated_at=ANY_BUT_NONE,
+        spans=[
+            SpanModel(
+                id=ANY_BUT_NONE,
+                name="bedrock_invoke_model_stream",
+                type="llm",
+                input={
+                    "body": request_body,
+                    "modelId": llm_constants.BEDROCK_OPENAI_GPT_OSS,
+                },
+                output=expected_output,
+                start_time=ANY_BUT_NONE,
+                end_time=ANY_BUT_NONE,
+                tags=["bedrock", "invoke_model"],
+                metadata=ANY_DICT.containing({"created_from": "bedrock"}),
+                last_updated_at=ANY_BUT_NONE,
+                model=llm_constants.BEDROCK_OPENAI_GPT_OSS,
+                usage=ANY_DICT.containing(EXPECTED_BEDROCK_USAGE_LOGGED_FORMAT),
+                provider="bedrock",
+                spans=[],
+                source="sdk",
+            )
+        ],
+        source="sdk",
+    )
+    assert len(fake_backend.trace_trees) == 1
+    assert_equal(expected_trace, fake_backend.trace_trees[0])
+
+    span = fake_backend.trace_trees[0].spans[0]
+    assert span.output["body"]["choices"][0]["message"]["content"]
+    assert span.usage["completion_tokens"] > 0
+
+
+def test_bedrock_invoke_model__untracked_client_read_after_tracked_call__payload_returned(
+    fake_backend,
+):
+    """Regression test for `return None` inside `finally`.
+
+    track_bedrock patches `read` on botocore's shared StreamingBody class, so
+    every response body in the process runs through the wrapper once a tracked
+    invoke_model call has been made - including bodies belonging to untracked
+    clients and to other AWS services. A `return` in `finally` overrides the
+    value returned by `try`, so an untracked read used to hand back None
+    instead of the payload.
+    """
+    request_body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 50,
+        "temperature": 0.1,
+        "messages": [{"role": "user", "content": "Hello, how are you?"}],
+    }
+
+    tracked_client = track_bedrock(
+        boto3.client("bedrock-runtime", region_name="us-east-1")
+    )
+    tracked_response = tracked_client.invoke_model(
+        modelId=llm_constants.BEDROCK_CLAUDE_SONNET,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    assert json.loads(tracked_response["body"].read())
+
+    untracked_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+    untracked_response = untracked_client.invoke_model(
+        modelId=llm_constants.BEDROCK_CLAUDE_SONNET,
+        body=json.dumps(request_body),
+        contentType="application/json",
+        accept="application/json",
+    )
+
+    payload = untracked_response["body"].read()
+
+    assert payload is not None
+    assert json.loads(payload)
+
+    opik.flush_tracker()
+
+    # Only the tracked call is logged; the untracked one must not be.
+    assert len(fake_backend.trace_trees) == 1

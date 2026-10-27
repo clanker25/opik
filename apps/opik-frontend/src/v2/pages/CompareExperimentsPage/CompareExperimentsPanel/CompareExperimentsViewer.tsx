@@ -1,0 +1,303 @@
+import React, { useMemo, useState } from "react";
+import sortBy from "lodash/sortBy";
+import isFunction from "lodash/isFunction";
+import isEmpty from "lodash/isEmpty";
+import { Braces, FlaskConical, ListTree, MessagesSquare } from "lucide-react";
+
+import SyntaxHighlighter from "@/shared/SyntaxHighlighter/SyntaxHighlighter";
+import AttachmentsList from "@/v2/pages-shared/traces/TraceDetailsPanel/TraceDataViewer/AttachmentsList";
+import { MediaProvider } from "@/shared/PrettyLLMMessage/llmMessages";
+import { useExperimentItemMedia } from "@/hooks/useExperimentItemMedia";
+import ExperimentMessagesViewer from "@/v2/pages-shared/experiments/ExperimentMessagesViewer/ExperimentMessagesViewer";
+import ExperimentFeedbackScoresViewer from "@/v2/pages-shared/ExperimentFeedbackScoresViewer/ExperimentFeedbackScoresViewer";
+import TooltipWrapper from "@/shared/TooltipWrapper/TooltipWrapper";
+import CopyButton from "@/shared/CopyButton/CopyButton";
+import NoData from "@/shared/NoData/NoData";
+import useExperimentById from "@/api/datasets/useExperimentById";
+import useTraceById from "@/api/traces/useTraceById";
+import { TraceFeedbackScore } from "@/types/traces";
+import { ExperimentItem } from "@/types/datasets";
+import { OnChangeFn } from "@/types/shared";
+import { Button } from "@/ui/button";
+import { useToast } from "@/ui/use-toast";
+import { traceExist, traceVisible } from "@/lib/traces";
+import ExperimentCommentsViewer from "./DataTab/ExperimentCommentsViewer";
+import { splitOutputForMessages } from "./splitOutputForMessages";
+import { CommentItems } from "@/types/comment";
+
+type CompareExperimentsViewerProps = {
+  experimentItem: ExperimentItem;
+  openTrace: OnChangeFn<string>;
+  sectionIdx: number;
+};
+
+const CompareExperimentsViewer: React.FunctionComponent<
+  CompareExperimentsViewerProps
+> = ({ experimentItem, openTrace, sectionIdx }) => {
+  const isTraceExist = traceExist(experimentItem);
+  const isTraceVisible = traceVisible(experimentItem);
+  const experimentId = experimentItem.experiment_id;
+
+  const { data } = useExperimentById(
+    {
+      experimentId,
+    },
+    {
+      refetchOnMount: false,
+    },
+  );
+
+  const name = data?.name || experimentId;
+
+  const { media, transformedOutput } = useExperimentItemMedia({
+    output: experimentItem.output,
+    traceId: experimentItem.trace_id,
+    projectId: data?.project_id,
+  });
+
+  const inputAndOutput = useMemo(
+    () => ({ input: experimentItem.input, output: experimentItem.output }),
+    [experimentItem.input, experimentItem.output],
+  );
+
+  // Extracted in one pass so input and output media share one placeholder
+  // numbering: separate passes both start at [image_0], and the provider would
+  // then resolve the output's [image_0] to the input's picture.
+  const {
+    media: inputAndOutputMedia,
+    transformedOutput: transformedInputAndOutput,
+  } = useExperimentItemMedia({ output: inputAndOutput });
+
+  const { input: messagesInput, output: messagesOutput } =
+    transformedInputAndOutput as typeof inputAndOutput;
+
+  const messagesMedia = useMemo(
+    () => [
+      ...inputAndOutputMedia,
+      ...media.filter((item) => item.source === "attachment"),
+    ],
+    [inputAndOutputMedia, media],
+  );
+
+  const { toast } = useToast();
+
+  const onChangeApplied = () =>
+    toast({
+      title: "Changes saved",
+      description: "The results table will reflect them within a minute.",
+    });
+
+  const { data: trace } = useTraceById(
+    {
+      traceId: experimentItem.trace_id as string,
+      stripAttachments: true,
+    },
+    {
+      enabled: Boolean(isTraceExist && experimentItem.trace_id),
+    },
+  );
+
+  const feedbackScores: TraceFeedbackScore[] = useMemo(
+    () =>
+      sortBy(
+        (trace ? trace.feedback_scores : experimentItem.feedback_scores) || [],
+        "name",
+      ),
+    [trace, experimentItem.feedback_scores],
+  );
+
+  const comments: CommentItems = useMemo(
+    () => (trace ? trace.comments : experimentItem.comments) || [],
+    [trace, experimentItem.comments],
+  );
+
+  // Gated on the output alone: mapAndCombineMessages silently drops a side it
+  // does not recognise, and this panel is the only place the output is shown.
+  const { rendersAsMessages, remainingOutput } = useMemo(
+    () => splitOutputForMessages(messagesOutput),
+    [messagesOutput],
+  );
+
+  // Scoped to the item because columns are reused across rows: a plain boolean
+  // would open every following row in raw mode too.
+  const [rawOutputItemId, setRawOutputItemId] = useState<string | null>(null);
+  const showRawOutput = rawOutputItemId === experimentItem.id;
+
+  const outputText = useMemo(
+    () => JSON.stringify(experimentItem.output, null, 2),
+    [experimentItem.output],
+  );
+
+  const onExpandClick = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (isFunction(openTrace) && experimentItem.trace_id) {
+      openTrace(experimentItem.trace_id);
+    }
+  };
+
+  const renderOutput = () => {
+    if (!isTraceExist) {
+      return (
+        <div className="mt-64">
+          <NoData
+            title="No related trace found"
+            message="It looks like it was deleted or not created"
+            className="min-h-24 text-center"
+          />
+        </div>
+      );
+    }
+
+    if (!experimentItem.output) {
+      return null;
+    }
+
+    const rawToggle = (
+      <TooltipWrapper
+        content={showRawOutput ? "Show as messages" : "Show raw output"}
+      >
+        <Button
+          variant="outline"
+          size="icon-2xs"
+          onClick={() =>
+            setRawOutputItemId(showRawOutput ? null : experimentItem.id)
+          }
+        >
+          {showRawOutput ? <MessagesSquare /> : <Braces />}
+        </Button>
+      </TooltipWrapper>
+    );
+
+    if (!rendersAsMessages || showRawOutput) {
+      // The raw view skips prettifying, which would show only the message text
+      // and hide every other key, and keeps its own mode so it does not share a
+      // stored "pretty" choice with the fallback viewer.
+      const highlighter = showRawOutput ? (
+        <SyntaxHighlighter
+          data={transformedOutput as object}
+          preserveKey={`syntax-highlighter-compare-experiment-output-raw-${sectionIdx}`}
+        />
+      ) : (
+        <SyntaxHighlighter
+          data={transformedOutput as object}
+          prettifyConfig={{ fieldType: "output" }}
+          preserveKey={`syntax-highlighter-compare-experiment-output-${sectionIdx}`}
+        />
+      );
+
+      const content = media.length ? (
+        <MediaProvider media={media}>
+          <div className="flex flex-col gap-2">
+            <AttachmentsList media={media} />
+            {highlighter}
+          </div>
+        </MediaProvider>
+      ) : (
+        highlighter
+      );
+
+      if (!rendersAsMessages) {
+        return content;
+      }
+
+      return (
+        <div className="flex flex-col">
+          <div className="flex justify-end pb-1">{rawToggle}</div>
+          {content}
+        </div>
+      );
+    }
+
+    return (
+      <MediaProvider media={messagesMedia}>
+        <div className="flex flex-col gap-2">
+          {/* Same list as the provider: the text is numbered across input and
+              output, so the output-only list would mislabel the thumbnails. */}
+          {messagesMedia.length > 0 && (
+            <AttachmentsList media={messagesMedia} />
+          )}
+          <ExperimentMessagesViewer
+            key={experimentItem.id}
+            input={messagesInput}
+            output={messagesOutput}
+            actions={
+              <>
+                {rawToggle}
+                <CopyButton
+                  text={outputText}
+                  message="Successfully copied output"
+                  tooltipText="Copy output"
+                  variant="outline"
+                  size="icon-2xs"
+                />
+              </>
+            }
+          />
+          {!isEmpty(remainingOutput) && (
+            <SyntaxHighlighter
+              data={remainingOutput}
+              prettifyConfig={{ fieldType: "output" }}
+              preserveKey={`syntax-highlighter-compare-experiment-output-remaining-${sectionIdx}`}
+            />
+          )}
+        </div>
+      </MediaProvider>
+    );
+  };
+
+  return (
+    <div className="relative flex h-full flex-col px-6 pt-4">
+      <div className="flex items-center justify-between gap-1 pb-4">
+        <TooltipWrapper content={name}>
+          <div className="flex items-center gap-2 overflow-hidden">
+            <FlaskConical className="size-4 shrink-0 text-muted-slate" />
+            <h2 className="comet-body-accented truncate">{name}</h2>
+          </div>
+        </TooltipWrapper>
+        {isTraceExist && isTraceVisible && (
+          <TooltipWrapper content="Click to open original trace">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onExpandClick}
+              className="shrink-0"
+            >
+              <ListTree className="mr-2 size-4 shrink-0" />
+              Trace
+            </Button>
+          </TooltipWrapper>
+        )}
+      </div>
+
+      {/* Scrolls within the column so a long conversation does not push the
+          scores and comments sections out of reach, and so each experiment
+          scrolls independently instead of the whole row moving as one block.
+          min-h-0 lets this flex child shrink below its content height. */}
+      <div className="min-h-0 flex-1 overflow-y-auto">{renderOutput()}</div>
+
+      {isTraceExist && (
+        <div className="sticky bottom-0 right-0 mt-auto flex max-h-[50vh] shrink-0 flex-col bg-background contain-content">
+          <div className="box-border flex min-h-14 shrink grow flex-col border-y">
+            <ExperimentFeedbackScoresViewer
+              feedbackScores={feedbackScores}
+              traceId={experimentItem.trace_id as string}
+              sectionIdx={sectionIdx}
+              onChangeApplied={onChangeApplied}
+            />
+          </div>
+
+          <div className="flex max-h-[35vh] min-h-14 shrink grow flex-col">
+            <ExperimentCommentsViewer
+              comments={comments}
+              traceId={experimentItem.trace_id as string}
+              sectionIdx={sectionIdx}
+              onChangeApplied={onChangeApplied}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default CompareExperimentsViewer;

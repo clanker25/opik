@@ -1,0 +1,233 @@
+---
+description: Start here to integrate Opik into your Ollama-based genai application
+  for end-to-end LLM observability, unit testing, and optimization.
+headline: Ollama
+og:description: Trace local Ollama models with Opik using track_ollama. Log prompts,
+  responses, token usage, streaming, tool calls and thinking output.
+og:site_name: Opik Documentation
+og:title: Integrate Ollama with Opik - Trace Local LLM Calls
+title: Observability for Ollama (Python) with Opik
+---
+
+[Ollama](https://ollama.com/) runs open models such as Llama, Qwen and Gemma on your own machine.
+
+Wrap your Ollama client with `track_ollama` and every chat call is logged to Opik with its messages, response, model and token usage. Streaming, async calls, tool calls and thinking models work out of the box.
+
+## Account Setup
+
+[Comet](https://www.comet.com/site?from=llm&utm_source=opik&utm_medium=colab&utm_content=ollama&utm_campaign=opik) provides a hosted version of the Opik platform, [simply create an account](https://www.comet.com/signup?from=llm&utm_source=opik&utm_medium=colab&utm_content=ollama&utm_campaign=opik) and grab your API Key.
+
+> You can also run the Opik platform locally, see the [installation guide](/self-host/overview) for more information.
+
+## Getting Started
+
+### Installation
+
+```bash wordWrap
+pip install -U "opik>=2.2.93" ollama
+```
+
+### Configuring Opik
+
+Run `opik configure` and follow the prompts. See the [Python SDK Configuration guide](/tracing/advanced/sdk_configuration) for other options, such as configuring Opik in code or with environment variables.
+
+### Configuring Ollama
+
+[Install Ollama](https://ollama.com/download), which starts the Ollama server, and download a model:
+
+```bash wordWrap
+ollama pull llama3.1
+```
+
+If your Ollama server isn't on `localhost`, set the `OLLAMA_HOST` environment variable or pass `host` to the client: `ollama.Client(host="http://my-server:11434")`.
+
+## Logging LLM calls
+
+Create an Ollama client, wrap it with `track_ollama`, and use it as usual:
+
+```python wordWrap
+import os
+
+import ollama
+from opik.integrations.ollama import track_ollama
+
+os.environ["OPIK_PROJECT_NAME"] = "ollama-integration-demo"
+
+client = track_ollama(ollama.Client())
+
+response = client.chat(
+    model="llama3.1",
+    messages=[{"role": "user", "content": "Why is the sky blue? Answer in one sentence."}],
+)
+
+print(response.message.content)
+```
+
+When the script runs, Opik prints a link to your project. Open it to see the trace with the messages, the response and the token usage:
+
+<Frame>
+  <img src="/img/tracing/ollama_integration.png" />
+</Frame>
+
+Only calls made through the wrapped client are logged. If you copied `ollama.chat(...)` from the Ollama README, switch it to `client.chat(...)`.
+
+## Advanced Usage
+
+The snippets below reuse the `client` from [Logging LLM calls](#logging-llm-calls).
+
+### Using with the `@track` decorator
+
+Decorate the functions of your application with [`@track`](/tracing/advanced/log_traces#using-function-decorators) to group several LLM calls into one trace:
+
+```python wordWrap
+from opik import track
+
+
+@track
+def generate_topic():
+    response = client.chat(
+        model="llama3.1",
+        messages=[{"role": "user", "content": "Give me a one-word topic for a story."}],
+    )
+    return response.message.content
+
+
+@track
+def generate_story(topic):
+    response = client.chat(
+        model="llama3.1",
+        messages=[{"role": "user", "content": f"Write a two sentence story about {topic}."}],
+    )
+    return response.message.content
+
+
+@track
+def generate_opik_story():
+    return generate_story(generate_topic())
+
+
+print(generate_opik_story())
+```
+
+Opik shows one `generate_opik_story` trace with both LLM calls nested inside it.
+
+### Streaming
+
+Streamed responses are logged as one span with the full text and token usage:
+
+```python wordWrap
+stream = client.chat(
+    model="llama3.1",
+    messages=[{"role": "user", "content": "Count from 1 to 5."}],
+    stream=True,
+)
+
+for chunk in stream:
+    print(chunk.message.content, end="", flush=True)
+```
+
+### Async client
+
+`track_ollama` works with `ollama.AsyncClient` too, including streaming:
+
+```python wordWrap
+import asyncio
+
+import ollama
+from opik.integrations.ollama import track_ollama
+
+async_client = track_ollama(ollama.AsyncClient())
+
+
+async def main():
+    response = await async_client.chat(
+        model="llama3.1",
+        messages=[{"role": "user", "content": "Why is the sky blue? Answer in one sentence."}],
+    )
+    print(response.message.content)
+
+
+asyncio.run(main())
+```
+
+### Tool calling
+
+The tools you pass and the tool calls the model makes are both logged:
+
+```python wordWrap
+def get_weather(city: str) -> str:
+    """Get the current weather for a city.
+
+    Args:
+      city: The name of the city
+    """
+    return "sunny"
+
+
+response = client.chat(
+    model="llama3.1",
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=[get_weather],
+)
+
+print(response.message.tool_calls)
+```
+
+### Thinking models
+
+With a thinking model such as Qwen 3 or DeepSeek-R1, pass `think=True`. Opik logs the model's reasoning next to its final answer:
+
+```python wordWrap
+response = client.chat(
+    model="qwen3:0.6b",
+    messages=[{"role": "user", "content": "Is 7 a prime number? Answer in one word."}],
+    think=True,
+)
+
+print(response.message.thinking)
+print(response.message.content)
+```
+
+## Cost Tracking
+
+Opik records token usage for your Ollama calls. Models you run on your own Ollama server have no per-token price, so no cost is estimated.
+
+## Supported Methods
+
+`track_ollama` logs `chat()` on `ollama.Client` and `ollama.AsyncClient`, with and without streaming. Other methods, such as `generate()` and `embed()`, aren't logged; to trace them, call them inside a function decorated with [`@track`](/tracing/advanced/log_traces#using-function-decorators).
+
+## Using Ollama through OpenAI or LangChain
+
+If your code calls Ollama through the OpenAI library or LangChain, keep that code and use the matching Opik integration instead of `track_ollama`.
+
+With the OpenAI library pointed at Ollama's [OpenAI-compatible API](https://docs.ollama.com/api/openai-compatibility), use the [OpenAI integration](/integrations/openai):
+
+```python wordWrap
+from openai import OpenAI
+from opik.integrations.openai import track_openai
+
+client = track_openai(
+    OpenAI(
+        base_url="http://localhost:11434/v1/",
+        api_key="ollama",  # required by the library, ignored by Ollama
+    )
+)
+
+completion = client.chat.completions.create(
+    model="llama3.1",
+    messages=[{"role": "user", "content": "Say this is a test"}],
+)
+
+print(completion.choices[0].message.content)
+```
+
+With LangChain's `ChatOllama` (`pip install -U langchain-ollama`), use the [LangChain integration](/integrations/langchain):
+
+```python wordWrap
+from langchain_ollama import ChatOllama
+from opik.integrations.langchain import OpikTracer
+
+llm = ChatOllama(model="llama3.1").with_config({"callbacks": [OpikTracer()]})
+
+print(llm.invoke("Translate to French: I love programming.").content)
+```

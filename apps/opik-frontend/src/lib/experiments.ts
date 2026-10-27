@@ -1,0 +1,203 @@
+import {
+  EVALUATION_METHOD,
+  Experiment,
+  ExperimentPromptVersion,
+  EXPERIMENT_STATUS,
+  TestSuiteExperiment,
+} from "@/types/datasets";
+import { ROW_HEIGHT } from "@/types/shared";
+import { getAlphabetLetter } from "@/lib/utils";
+
+export const generateCompareExperimentsURL = (
+  workspace: string,
+  projectId: string,
+  datasetId: string,
+  experimentIds: string[],
+): string => {
+  const basePath = import.meta.env.VITE_BASE_URL || "/";
+  const search = new URLSearchParams({
+    experiments: JSON.stringify(experimentIds),
+  }).toString();
+  const relativePath = `${workspace}/projects/${projectId}/experiments/${datasetId}/compare?${search}`;
+
+  const normalizedBasePath =
+    basePath === "/" ? "" : basePath.replace(/\/$/, "");
+  const fullPath = `${normalizedBasePath}/${relativePath}`;
+  return new URL(fullPath, window.location.origin).toString();
+};
+
+const RUN_SUFFIX_RE = /_(\d+)$/;
+
+export const buildExperimentName = (name: string, promptIndex: number) =>
+  `${name.trim()}_${getAlphabetLetter(promptIndex).toLowerCase()}`;
+
+export const suggestNextExperimentName = (
+  name: string,
+  lastSuggested: string | null,
+) => {
+  const trimmed = name.trim();
+  const match =
+    lastSuggested && trimmed === lastSuggested.trim()
+      ? trimmed.match(RUN_SUFFIX_RE)
+      : null;
+
+  if (!match) return `${trimmed}_02`;
+
+  const next = String(Number(match[1]) + 1).padStart(match[1].length, "0");
+  return trimmed.replace(RUN_SUFFIX_RE, `_${next}`);
+};
+
+/**
+ * Human-readable label for a prompt version linked to an experiment: the
+ * prompt name plus its version (e.g. "My Prompt (v3)"). Prefers the sequential
+ * version number, falls back to the commit hash when it's unavailable, and
+ * omits the parenthetical entirely when neither is present (OPIK-6838).
+ * Undefined for a deleted prompt (the backend omits its name), which every
+ * ResourceLink consumer renders as its disabled "Deleted prompt" state.
+ *
+ * Single source of truth so the experiments table, the single-experiment
+ * Configuration tab, and the dashboard leaderboard widget stay consistent.
+ */
+export const formatPromptVersionLabel = (
+  promptVersion: Pick<
+    ExperimentPromptVersion,
+    "prompt_name" | "version_number" | "commit"
+  >,
+): string | undefined => {
+  if (!promptVersion.prompt_name) return undefined;
+
+  const version = promptVersion.version_number ?? promptVersion.commit;
+  return version
+    ? `${promptVersion.prompt_name} (${version})`
+    : promptVersion.prompt_name;
+};
+
+// The compare row's text needs a word for a deleted prompt where links use
+// ResourceLink's deleted state.
+const toComparableLabel = (promptVersion: ExperimentPromptVersion) =>
+  formatPromptVersionLabel(promptVersion) ?? "Deleted prompt";
+
+/**
+ * Prompt versions in label order: case-insensitive, with version numbers
+ * compared numerically so v2 comes before v10. Ties (prompt names are only
+ * unique per project, and every deleted prompt reads the same) fall back to
+ * ids so the order never depends on the order the backend returns. The
+ * compare view renders these as tags alongside the text it diffs on, so both
+ * must share one order.
+ */
+export const sortPromptVersions = (
+  promptVersions: ExperimentPromptVersion[],
+): ExperimentPromptVersion[] =>
+  [...promptVersions].sort(
+    (a, b) =>
+      toComparableLabel(a).localeCompare(toComparableLabel(b), undefined, {
+        sensitivity: "base",
+        numeric: true,
+      }) ||
+      a.prompt_id.localeCompare(b.prompt_id) ||
+      a.id.localeCompare(b.id),
+  );
+
+/**
+ * Every prompt version linked to an experiment, as one comparable string
+ * (e.g. "Guardrail (v1), My Prompt (v3)"). Returns undefined when the
+ * experiment has no linked prompt, which the compare table renders as
+ * "No value" like any other absent field.
+ *
+ * Labels are sorted so the compare view diffs on content rather than on the
+ * order the backend happened to return: two experiments linked to the same
+ * prompt versions must read as identical.
+ */
+export const formatExperimentPromptVersions = (
+  experiment: Pick<Experiment, "prompt_versions"> | undefined,
+): string | undefined => {
+  const promptVersions = experiment?.prompt_versions;
+  if (!promptVersions?.length) return undefined;
+
+  return sortPromptVersions(promptVersions).map(toComparableLabel).join(", ");
+};
+
+export const isExperimentTerminal = (
+  status: EXPERIMENT_STATUS | undefined | null,
+): boolean =>
+  status === EXPERIMENT_STATUS.COMPLETED ||
+  status === EXPERIMENT_STATUS.CANCELLED ||
+  status === EXPERIMENT_STATUS.FAILED;
+
+/**
+ * How long a run is worth watching before it is treated as abandoned rather than slow.
+ *
+ * Measured from the experiment's own created_at rather than from when this tab started looking,
+ * so it survives a reload: isRunInFlight is persisted, and a session-local timer would restart
+ * with every visit and never reach its own ceiling.
+ */
+export const MAX_WATCH_AGE_MS = 6 * 60 * 60 * 1000;
+
+export const isPastWatchAge = (
+  experiment: Pick<Experiment, "created_at"> | undefined,
+): boolean => {
+  if (!experiment?.created_at) return false;
+  return (
+    Date.now() - new Date(experiment.created_at).getTime() > MAX_WATCH_AGE_MS
+  );
+};
+
+export function isTestSuiteExperiment(
+  experiment: Experiment | null | undefined,
+): experiment is TestSuiteExperiment {
+  return experiment?.evaluation_method === EVALUATION_METHOD.TEST_SUITE;
+}
+
+export const EXPERIMENT_TAB = {
+  items: "items",
+  insights: "insights",
+  config: "config",
+  scores: "scores",
+  logs: "logs",
+} as const;
+
+export type ExperimentTabId =
+  (typeof EXPERIMENT_TAB)[keyof typeof EXPERIMENT_TAB];
+
+const EXPERIMENT_TAB_IDS: readonly string[] = Object.values(EXPERIMENT_TAB);
+
+/** Narrows an arbitrary URL value to a known tab id, so the page can fall back when it isn't one. */
+export const isExperimentTabId = (value: unknown): value is ExperimentTabId =>
+  typeof value === "string" && EXPERIMENT_TAB_IDS.includes(value);
+
+/**
+ * Which tabs the experiment page exposes, in display order.
+ *
+ * Insights and feedback scores don't apply to test-suite experiments; feedback scores also need at
+ * least one loaded experiment. Logs is always available — every experiment run produces traces, and
+ * comparisons show the traces of all compared experiments (OPIK-6739).
+ */
+export const getAvailableExperimentTabs = (
+  experiments: Experiment[],
+): ExperimentTabId[] => {
+  const isTestSuite = isTestSuiteExperiment(experiments[0]);
+
+  return [
+    EXPERIMENT_TAB.items,
+    ...(!isTestSuite ? [EXPERIMENT_TAB.insights] : []),
+    EXPERIMENT_TAB.config,
+    ...(experiments.length > 0 && !isTestSuite ? [EXPERIMENT_TAB.scores] : []),
+    EXPERIMENT_TAB.logs,
+  ];
+};
+
+export const calculateLineHeight = (
+  height: ROW_HEIGHT,
+  lineCount: number = 1,
+) => {
+  const lineHeight = 16;
+  const lineHeightMap: Record<ROW_HEIGHT, number> = {
+    [ROW_HEIGHT.small]: 1,
+    [ROW_HEIGHT.medium]: 4,
+    [ROW_HEIGHT.large]: 12,
+  };
+
+  return {
+    height: `${lineCount * lineHeightMap[height] * lineHeight}px`,
+  };
+};

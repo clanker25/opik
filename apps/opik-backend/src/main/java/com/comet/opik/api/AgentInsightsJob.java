@@ -1,0 +1,81 @@
+package com.comet.opik.api;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonValue;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import com.fasterxml.jackson.databind.annotation.JsonNaming;
+import io.swagger.v3.oas.annotations.media.Schema;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
+
+import java.time.Instant;
+import java.util.UUID;
+
+@Builder(toBuilder = true)
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+public record AgentInsightsJob(
+        @JsonIgnore String workspaceId,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) UUID id,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY, requiredMode = Schema.RequiredMode.REQUIRED) UUID projectId,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) Status status,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) boolean autoFirstRunEnrolled,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) Instant autoFirstRunAt,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) Instant lastScanAt,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) String lastFailureReason,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) String lastFailureDetail,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) Instant lastFailedAt,
+        // The guidance fields are left out (null) while the guidance toggle is off.
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY, description = "Project guidance sent to every run; null when none") String guidance,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY, description = "Who last saved the guidance") String guidanceUpdatedBy,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY, description = "When the guidance was last saved") Instant guidanceUpdatedAt,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY, description = "Bumped each time the guidance text changes; 0 = never saved") Integer guidanceVersion,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY, description = "Guidance version the current results were produced with; null = no run since guidance existed") Integer resultsGuidanceVersion,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) Instant createdAt,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) String createdBy,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) Instant lastUpdatedAt,
+        @Schema(accessMode = Schema.AccessMode.READ_ONLY) String lastUpdatedBy) {
+
+    public static class FailureReason {
+        // The trigger was rejected because the organization can't afford the run. No pod was allocated.
+        public static final String OUT_OF_CREDITS = "out_of_credits";
+        // The trigger never reached Ollie, so Ollie cannot report this itself.
+        public static final String DID_NOT_START = "did_not_start";
+        // Comet's free-run budget is spent, not the customer's credits. Not the customer's failure: it
+        // cancels the auto-first-run rollout instead of being recorded against their project.
+        public static final String FREE_POOL_EXHAUSTED = "free_pool_exhausted";
+        // An automatic run claimed longer ago than the timeout, with neither a result nor a failure: it died
+        // without reporting. Retryable.
+        public static final String TIMED_OUT = "timed_out";
+    }
+
+    @RequiredArgsConstructor
+    @Getter
+    public enum Status {
+        ENABLED("enabled"),
+        DISABLED("disabled");
+
+        @JsonValue
+        private final String value;
+
+        @JsonCreator
+        public static Status fromString(String value) {
+            for (Status status : values()) {
+                if (status.value.equals(value)) {
+                    return status;
+                }
+            }
+            throw new IllegalArgumentException("Unknown agent insights job status: " + value);
+        }
+    }
+
+    // Cross-workspace projection for the daily sweep: carries workspaceId (the cron runs in system
+    // context, with no request-scoped auth) alongside the project it targets.
+    @Builder(toBuilder = true)
+    public record EnabledJob(@NonNull UUID id, @NonNull String workspaceId, @NonNull UUID projectId) {
+    }
+}

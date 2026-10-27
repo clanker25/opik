@@ -1,0 +1,355 @@
+import { useEffect, useRef, useState, useCallback } from "react";
+import { debounce } from "lodash";
+
+import { useDashboardStore } from "@/store/DashboardStore";
+import useDashboardById from "@/api/dashboards/useDashboardById";
+import useDashboardUpdateMutation from "@/api/dashboards/useDashboardUpdateMutation";
+import {
+  keepaliveSaveDashboard,
+  keepaliveSaveInsightsView,
+} from "@/api/dashboards/dashboardKeepaliveSave";
+import useInsightsViewById from "@/api/insights-views/useInsightsViewById";
+import useInsightsViewUpdateMutation from "@/api/insights-views/useInsightsViewUpdateMutation";
+import {
+  Dashboard,
+  DASHBOARD_SCOPE,
+  DashboardState,
+  WIDGET_TYPE,
+} from "@/types/dashboard";
+import { OpikEvent, trackEvent } from "@/lib/analytics/tracking";
+import {
+  DASHBOARD_EXTERNAL_UPDATE_EVENT,
+  isDashboardChanged,
+} from "@/lib/dashboard/utils";
+import {
+  loadLocal,
+  saveLocal,
+  clearLocal,
+} from "@/lib/dashboard/dashboardLocalDb";
+
+export type DashboardSaveStatus = "idle" | "saving" | "saved" | "error";
+
+const AUTOSAVE_DEBOUNCE_MS = 2000;
+const SAVED_STATUS_DISPLAY_MS = 3000;
+
+interface ApiConfig {
+  useByIdHook: typeof useDashboardById;
+  useUpdateMutationHook: typeof useDashboardUpdateMutation;
+  keepaliveSaveFn: typeof keepaliveSaveDashboard;
+}
+
+const DASHBOARD_API_CONFIG: ApiConfig = {
+  useByIdHook: useDashboardById,
+  useUpdateMutationHook: useDashboardUpdateMutation,
+  keepaliveSaveFn: keepaliveSaveDashboard,
+};
+
+const INSIGHTS_API_CONFIG: ApiConfig = {
+  useByIdHook: useInsightsViewById,
+  useUpdateMutationHook: useInsightsViewUpdateMutation,
+  keepaliveSaveFn: keepaliveSaveInsightsView,
+};
+
+// Widgets can tell a query that 404s because it isn't saved yet from one whose widget is gone.
+const publishSavedWidgets = (config: DashboardState | null) =>
+  useDashboardStore
+    .getState()
+    .setSavedWidgetIds(
+      config
+        ? config.sections.flatMap((section) =>
+            section.widgets.map((widget) => widget.id),
+          )
+        : null,
+    );
+
+// Once per open: whether dashboards holding Ollie charts keep being looked at.
+const reportOllieWidgets = (dashboard: Dashboard, config: DashboardState) => {
+  const count = config.sections.reduce(
+    (total, section) =>
+      total +
+      section.widgets.filter(
+        (widget) => widget.type === WIDGET_TYPE.OLLIE_CHART,
+      ).length,
+    0,
+  );
+  if (!count) return;
+  trackEvent(OpikEvent.DASHBOARD_WITH_OLLIE_WIDGETS_OPENED, {
+    dashboard_id: dashboard.id,
+    dashboard_type: dashboard.type,
+    dashboard_scope: dashboard.scope,
+    project_id: dashboard.project_id,
+    ollie_widget_count: count,
+  });
+};
+
+const getApiConfig = (scope?: DASHBOARD_SCOPE): ApiConfig => {
+  if (scope === DASHBOARD_SCOPE.INSIGHTS) {
+    return INSIGHTS_API_CONFIG;
+  }
+  return DASHBOARD_API_CONFIG;
+};
+
+interface UseDashboardPersistenceParams {
+  dashboardId: string;
+  enabled?: boolean;
+  scope?: DASHBOARD_SCOPE;
+}
+
+interface UseDashboardPersistenceReturn {
+  dashboard: Dashboard | undefined;
+  isPending: boolean;
+  resolvedConfig: DashboardState | null;
+  saveStatus: DashboardSaveStatus;
+}
+
+export const useDashboardPersistence = ({
+  dashboardId,
+  enabled = true,
+  scope,
+}: UseDashboardPersistenceParams): UseDashboardPersistenceReturn => {
+  const apiConfig = getApiConfig(scope);
+
+  const {
+    data: dashboard,
+    isPending,
+    refetch,
+  } = apiConfig.useByIdHook({ dashboardId }, { enabled });
+
+  const { mutate: syncToServer } = apiConfig.useUpdateMutationHook({
+    skipDefaultError: true,
+  });
+
+  const dashboardRef = useRef(dashboard);
+  dashboardRef.current = dashboard;
+
+  const [resolvedConfig, setResolvedConfig] = useState<DashboardState | null>(
+    null,
+  );
+  const resolvedConfigRef = useRef(resolvedConfig);
+  resolvedConfigRef.current = resolvedConfig;
+
+  useEffect(() => {
+    const currentDashboard = dashboardRef.current;
+    if (!currentDashboard?.config) return;
+
+    let cancelled = false;
+
+    loadLocal(currentDashboard.id).then((localEntry) => {
+      if (cancelled) return;
+      publishSavedWidgets(currentDashboard.config);
+
+      if (
+        localEntry &&
+        localEntry.savedAt >
+          new Date(currentDashboard.last_updated_at).getTime() &&
+        isDashboardChanged(localEntry.config, currentDashboard.config)
+      ) {
+        setResolvedConfig(localEntry.config);
+        reportOllieWidgets(currentDashboard, localEntry.config);
+        syncToServer(
+          {
+            dashboard: {
+              id: currentDashboard.id,
+              config: localEntry.config,
+            },
+          },
+          {
+            onSuccess: () => {
+              if (dashboardRef.current?.id === currentDashboard.id) {
+                publishSavedWidgets(localEntry.config);
+              }
+            },
+            onSettled: () => clearLocal(currentDashboard.id),
+          },
+        );
+      } else {
+        setResolvedConfig(currentDashboard.config);
+        reportOllieWidgets(currentDashboard, currentDashboard.config);
+        if (localEntry) {
+          clearLocal(currentDashboard.id);
+        }
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      setResolvedConfig(null);
+      publishSavedWidgets(null);
+    };
+  }, [dashboard?.id, syncToServer]);
+
+  // Another writer (Ollie's "Add to dashboard" / "Save changes") updated this dashboard on the server. The page only
+  // loads the server config when the id changes, so reload it explicitly; otherwise the next autosave of the stale
+  // local state would overwrite the change.
+  useEffect(() => {
+    const onExternalUpdate = (event: Event) => {
+      const { id } = (event as CustomEvent<{ id: string }>).detail ?? {};
+      if (!id || id !== dashboardRef.current?.id) return;
+      refetch().then(({ data }) => {
+        if (!data?.config) return;
+        lastSavedConfigRef.current = data.config;
+        // Unchanged data keeps its reference, so setting it again re-renders nothing and no cleanup would clear the flag.
+        if (data.config === resolvedConfigRef.current) return;
+        // The store still holds the pre-update state; don't let the autosave cleanup flush it over the server copy.
+        externalReloadRef.current = true;
+        reloadEpochRef.current += 1;
+        reloadedConfigRef.current = data.config;
+        publishSavedWidgets(data.config);
+        // A local copy of edits made before the reload would otherwise win on the next mount and drop the update.
+        clearLocal(id);
+        setResolvedConfig(data.config);
+      });
+    };
+    window.addEventListener(DASHBOARD_EXTERNAL_UPDATE_EVENT, onExternalUpdate);
+    return () =>
+      window.removeEventListener(
+        DASHBOARD_EXTERNAL_UPDATE_EVENT,
+        onExternalUpdate,
+      );
+  }, [refetch]);
+
+  const lastSavedConfigRef = useRef<DashboardState | null>(null);
+  const externalReloadRef = useRef(false);
+  const reloadEpochRef = useRef(0);
+  const reloadedConfigRef = useRef<DashboardState | null>(null);
+  const [saveStatus, setSaveStatus] = useState<DashboardSaveStatus>("idle");
+  const savedTimerRef = useRef<ReturnType<typeof setTimeout>>();
+
+  const { mutate: updateDashboard } = apiConfig.useUpdateMutationHook({
+    skipDefaultError: true,
+    retry: 1,
+    retryDelay: AUTOSAVE_DEBOUNCE_MS * 2,
+  });
+
+  const performSave = useCallback(
+    function save(
+      targetDashboardId: string,
+      config: DashboardState,
+      onSaved?: () => void,
+    ) {
+      if (!isDashboardChanged(config, lastSavedConfigRef.current)) return;
+
+      setSaveStatus("saving");
+      const epoch = reloadEpochRef.current;
+
+      updateDashboard(
+        {
+          dashboard: {
+            id: targetDashboardId,
+            config,
+          },
+        },
+        {
+          onSuccess: () => {
+            lastSavedConfigRef.current = config;
+            // Sent before an external reload, so it may have landed after the other writer's update and overwritten it.
+            // Save the reloaded config again (the store may not hold it yet), then anything edited since.
+            if (
+              epoch !== reloadEpochRef.current &&
+              reloadedConfigRef.current &&
+              dashboardRef.current?.id === targetDashboardId
+            ) {
+              save(targetDashboardId, reloadedConfigRef.current, () =>
+                save(
+                  targetDashboardId,
+                  useDashboardStore.getState().getDashboard(),
+                ),
+              );
+              return;
+            }
+            // A flush on leaving a dashboard can land after the next one loaded.
+            if (dashboardRef.current?.id === targetDashboardId) {
+              publishSavedWidgets(config);
+            }
+            clearLocal(targetDashboardId);
+            setSaveStatus("saved");
+            clearTimeout(savedTimerRef.current);
+            savedTimerRef.current = setTimeout(() => {
+              setSaveStatus("idle");
+            }, SAVED_STATUS_DISPLAY_MS);
+            onSaved?.();
+          },
+          onError: () => {
+            setSaveStatus("error");
+          },
+        },
+      );
+    },
+    [updateDashboard],
+  );
+
+  const keepaliveSaveFn = apiConfig.keepaliveSaveFn;
+
+  useEffect(() => {
+    if (!enabled || !dashboard?.id || !resolvedConfig) return;
+
+    let prevLastModified = 0;
+
+    const debouncedSave = debounce((config: DashboardState) => {
+      performSave(dashboardId, config);
+    }, AUTOSAVE_DEBOUNCE_MS);
+
+    const unsubscribe = useDashboardStore.subscribe((state) => {
+      if (state.lastModified === 0) return;
+      if (state.lastModified === prevLastModified) return;
+      prevLastModified = state.lastModified;
+
+      const config = state.getDashboard();
+
+      if (lastSavedConfigRef.current === null) {
+        lastSavedConfigRef.current = config;
+        return;
+      }
+
+      const hasChanges = isDashboardChanged(config, lastSavedConfigRef.current);
+
+      if (hasChanges) {
+        saveLocal(dashboardId, config);
+        debouncedSave(config);
+      }
+    });
+
+    const handleBeforeUnload = () => {
+      debouncedSave.cancel();
+
+      const config = useDashboardStore.getState().getDashboard();
+      if (isDashboardChanged(config, lastSavedConfigRef.current)) {
+        saveLocal(dashboardId, config);
+        keepaliveSaveFn(dashboardId, config);
+      }
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      unsubscribe();
+      debouncedSave.cancel();
+      const state = useDashboardStore.getState();
+      const externalReload = externalReloadRef.current;
+      externalReloadRef.current = false;
+      if (!externalReload && state.lastModified !== 0) {
+        const config = state.getDashboard();
+        if (isDashboardChanged(config, lastSavedConfigRef.current)) {
+          performSave(dashboardId, config);
+        }
+      }
+      lastSavedConfigRef.current = null;
+      clearTimeout(savedTimerRef.current);
+    };
+  }, [
+    enabled,
+    dashboard?.id,
+    resolvedConfig,
+    dashboardId,
+    performSave,
+    keepaliveSaveFn,
+  ]);
+
+  return {
+    dashboard,
+    isPending,
+    resolvedConfig,
+    saveStatus,
+  };
+};

@@ -1,0 +1,229 @@
+import React from "react";
+
+import SliderInputControl from "@/shared/SliderInputControl/SliderInputControl";
+import PromptModelSettingsTooltipContent from "@/v2/pages-shared/llm/PromptModelSettings/providerConfigs/PromptModelConfigsTooltipContent";
+import {
+  createSupports,
+  getOpenAIVisibleControls,
+  isAnyControlVisible,
+} from "@/v2/pages-shared/llm/PromptModelSettings/providerConfigs/visibleControls";
+import {
+  LLMOpenAIConfigsType,
+  OpenAiPipelineMode,
+  OpenAIReasoningEffort,
+  PROVIDER_MODEL_TYPE,
+  PROVIDER_TYPE,
+} from "@/types/providers";
+import { DEFAULT_OPEN_AI_CONFIGS } from "@/constants/llm";
+import {
+  getMaxCompletionTokensRange,
+  getOpenAIReasoningEffortOptions,
+  resolveEffort,
+  resolveMaxCompletionTokens,
+  resolveSamplingParams,
+} from "@/lib/modelUtils";
+import { ModelConfigParam } from "@/v2/pages-shared/llm/PromptModelSettings/modelConfigParams";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/ui/select";
+import { Label } from "@/ui/label";
+import ExplainerIcon from "@/shared/ExplainerIcon/ExplainerIcon";
+
+interface OpenAIModelSettingsProps {
+  configs: Partial<LLMOpenAIConfigsType>;
+  model?: PROVIDER_MODEL_TYPE | "";
+  onChange: (configs: Partial<LLMOpenAIConfigsType>) => void;
+  unsupportedParams?: ReadonlySet<ModelConfigParam>;
+  openAiPipelineMode?: OpenAiPipelineMode;
+}
+
+const OpenAIModelConfigs = ({
+  configs,
+  model,
+  onChange,
+  unsupportedParams,
+  openAiPipelineMode,
+}: OpenAIModelSettingsProps) => {
+  const { temperature, topP } = resolveSamplingParams(model ?? "", configs);
+  const { reasoningEffort } = resolveEffort(
+    model ?? "",
+    configs,
+    openAiPipelineMode,
+  );
+  const visible = getOpenAIVisibleControls({
+    model,
+    configs,
+    supports: createSupports(unsupportedParams),
+    openAiPipelineMode,
+  });
+  const maxCompletionTokensRange = getMaxCompletionTokensRange(
+    PROVIDER_TYPE.OPEN_AI,
+    model ?? "",
+    openAiPipelineMode,
+  );
+
+  if (!isAnyControlVisible(visible)) return null;
+
+  return (
+    <div className="flex w-72 flex-col gap-6">
+      {visible.temperature && (
+        <SliderInputControl
+          value={temperature}
+          onChange={(v) => onChange({ temperature: v })}
+          id="temperature"
+          min={0}
+          max={2}
+          step={0.01}
+          defaultValue={DEFAULT_OPEN_AI_CONFIGS.TEMPERATURE}
+          label="Temperature"
+          tooltip={
+            <PromptModelSettingsTooltipContent text="Controls randomness: Lowering results in less random completions. As the temperature approaches zero, the model will become deterministic and repetitive." />
+          }
+        />
+      )}
+
+      {visible.maxCompletionTokens && (
+        <SliderInputControl
+          value={resolveMaxCompletionTokens(
+            PROVIDER_TYPE.OPEN_AI,
+            model ?? "",
+            configs.maxCompletionTokens,
+            openAiPipelineMode,
+          )}
+          onChange={(v) => onChange({ maxCompletionTokens: v })}
+          id="maxCompletionTokens"
+          min={maxCompletionTokensRange.min}
+          max={maxCompletionTokensRange.max}
+          step={1}
+          integer
+          defaultValue={DEFAULT_OPEN_AI_CONFIGS.MAX_COMPLETION_TOKENS}
+          label="Max output tokens"
+          tooltip={
+            <PromptModelSettingsTooltipContent
+              text={`The maximum number of tokens the model can generate in its response. The prompt does not count toward it. On reasoning models, reasoning tokens count toward it too, so a low limit can leave the response empty. The exact limit varies by model. The minimum is ${maxCompletionTokensRange.min}. (One token is roughly 4 characters for standard English text).`}
+            />
+          }
+        />
+      )}
+
+      {visible.topP && (
+        <SliderInputControl
+          value={topP}
+          onChange={(v) => onChange({ topP: v })}
+          id="topP"
+          min={0}
+          max={1}
+          step={0.01}
+          defaultValue={DEFAULT_OPEN_AI_CONFIGS.TOP_P}
+          label="Top P"
+          tooltip={
+            <PromptModelSettingsTooltipContent text="Controls diversity via nucleus sampling: 0.5 means half of all likelihood-weighted options are considered" />
+          }
+        />
+      )}
+
+      {visible.frequencyPenalty && (
+        <SliderInputControl
+          value={configs.frequencyPenalty}
+          onChange={(v) => onChange({ frequencyPenalty: v })}
+          id="frequencyPenalty"
+          min={-2}
+          max={2}
+          step={0.01}
+          defaultValue={DEFAULT_OPEN_AI_CONFIGS.FREQUENCY_PENALTY}
+          label="Frequency penalty"
+          tooltip={
+            <PromptModelSettingsTooltipContent text="How much to penalize new tokens based on their existing frequency in the text so far. Decreases the model's likelihood to repeat the same line verbatim" />
+          }
+        />
+      )}
+
+      {visible.presencePenalty && (
+        <SliderInputControl
+          value={configs.presencePenalty}
+          onChange={(v) => onChange({ presencePenalty: v })}
+          id="presencePenalty"
+          min={-2}
+          max={2}
+          step={0.01}
+          defaultValue={DEFAULT_OPEN_AI_CONFIGS.PRESENCE_PENALTY}
+          label="Presence penalty"
+          tooltip={
+            <PromptModelSettingsTooltipContent text="How much to penalize new tokens based on whether they appear in the text so far. Increases the model's likelihood to talk about new topics" />
+          }
+        />
+      )}
+
+      {visible.reasoningEffort && (
+        <div className="space-y-2">
+          <div className="flex items-center space-x-2">
+            <Label htmlFor="reasoningEffort" className="text-sm font-medium">
+              Reasoning effort
+            </Label>
+            <ExplainerIcon description="Controls how much effort the model puts into reasoning before responding. Higher effort may result in more thoughtful but slower responses." />
+          </div>
+          <Select
+            value={reasoningEffort}
+            onValueChange={(value: OpenAIReasoningEffort) =>
+              onChange({ reasoningEffort: value })
+            }
+          >
+            <SelectTrigger>
+              <SelectValue placeholder="Select reasoning effort" />
+            </SelectTrigger>
+            <SelectContent>
+              {getOpenAIReasoningEffortOptions(model, openAiPipelineMode).map(
+                (opt) => (
+                  <SelectItem key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </SelectItem>
+                ),
+              )}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {visible.throttling && (
+        <SliderInputControl
+          value={configs.throttling ?? DEFAULT_OPEN_AI_CONFIGS.THROTTLING}
+          onChange={(v) => onChange({ throttling: v })}
+          id="throttling"
+          min={0}
+          max={10}
+          step={0.1}
+          defaultValue={DEFAULT_OPEN_AI_CONFIGS.THROTTLING}
+          label="Throttling (seconds)"
+          tooltip={
+            <PromptModelSettingsTooltipContent text="Minimum time in seconds between consecutive requests to avoid rate limiting" />
+          }
+        />
+      )}
+
+      {visible.maxConcurrentRequests && (
+        <SliderInputControl
+          value={
+            configs.maxConcurrentRequests ??
+            DEFAULT_OPEN_AI_CONFIGS.MAX_CONCURRENT_REQUESTS
+          }
+          onChange={(v) => onChange({ maxConcurrentRequests: v })}
+          id="maxConcurrentRequests"
+          min={1}
+          max={20}
+          step={1}
+          defaultValue={DEFAULT_OPEN_AI_CONFIGS.MAX_CONCURRENT_REQUESTS}
+          label="Max concurrent requests"
+          tooltip={
+            <PromptModelSettingsTooltipContent text="Maximum number of requests that can run simultaneously. Set to 1 for sequential execution, higher values for parallel processing" />
+          }
+        />
+      )}
+    </div>
+  );
+};
+
+export default OpenAIModelConfigs;

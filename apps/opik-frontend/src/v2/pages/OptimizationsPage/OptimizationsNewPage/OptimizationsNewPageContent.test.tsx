@@ -1,0 +1,337 @@
+import type { ComponentProps } from "react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen } from "@testing-library/react";
+import OptimizationsNewPageContent from "./OptimizationsNewPageContent";
+
+// ---------------------------------------------------------------------------
+// Mock the complex child sections so we can focus on the footer logic.
+// ---------------------------------------------------------------------------
+vi.mock("./OptimizationsNewPromptSection", () => ({
+  default: () => <div data-testid="prompt-section" />,
+}));
+
+vi.mock("./OptimizationsNewConfigSidebar", () => ({
+  default: () => <div data-testid="config-sidebar" />,
+}));
+
+// ---------------------------------------------------------------------------
+// Minimal RHF form state returned by the handlers hook.
+// ---------------------------------------------------------------------------
+const makeFormState = (overrides = {}) => ({
+  isSubmitting: false,
+  errors: {},
+  ...overrides,
+});
+
+type MockHandlers = {
+  model: string;
+  optimizerModel?: string;
+  isDatasetError: boolean;
+  hasMissingVariables?: boolean;
+  missingDatasetVariables?: string[];
+  isDatasetLoading?: boolean;
+  datasetId?: string;
+  isSubmitting?: boolean;
+  dirtyFields?: Record<string, unknown>;
+};
+
+// Factory that returns a mock matching useOptimizationsNewFormHandlers' shape.
+const makeHandlers = (overrides: MockHandlers) => ({
+  form: {
+    formState: makeFormState({
+      isSubmitting: overrides.isSubmitting ?? false,
+      dirtyFields: overrides.dirtyFields ?? {},
+    }),
+    handleSubmit: vi.fn(() => () => Promise.resolve()),
+  },
+  activeProjectId: "proj-1",
+  optimizerType: "gepa",
+  metricType: "equals",
+  model: overrides.model,
+  config: {},
+  optimizerModel: overrides.optimizerModel ?? "",
+  datasetId: overrides.datasetId ?? "dataset-1",
+  datasetSample: [],
+  datasetVariables: [],
+  missingDatasetVariables: overrides.missingDatasetVariables ?? [],
+  isDatasetLoading: overrides.isDatasetLoading ?? false,
+  isDatasetError: overrides.isDatasetError,
+  handleDatasetChange: vi.fn(),
+  handleOptimizerTypeChange: vi.fn(),
+  handleOptimizerParamsChange: vi.fn(),
+  handleMetricTypeChange: vi.fn(),
+  handleMetricParamsChange: vi.fn(),
+  handleModelConfigChange: vi.fn(),
+  handleModelChange: vi.fn(),
+  submitOptimization: vi.fn(),
+  handleNameChange: vi.fn(),
+  getFirstMetricParamsError: vi.fn(),
+});
+
+vi.mock("./useOptimizationsNewFormHandlers", () => ({
+  useOptimizationsNewFormHandlers: vi.fn(),
+}));
+
+import { useOptimizationsNewFormHandlers } from "./useOptimizationsNewFormHandlers";
+
+const mockUseHandlers = vi.mocked(useOptimizationsNewFormHandlers);
+
+// ---------------------------------------------------------------------------
+// Helper: render the component with explicit prop permutations.
+// ---------------------------------------------------------------------------
+const renderContent = ({
+  availableModels = ["openai/gpt-4o"],
+  providerKeysReady = true,
+  model = "openai/gpt-4o",
+  optimizerModel,
+  isDatasetError = false,
+  savedModelReplacement,
+  dirtyFields,
+}: {
+  availableModels?: string[];
+  providerKeysReady?: boolean;
+  model?: string;
+  optimizerModel?: string;
+  isDatasetError?: boolean;
+  savedModelReplacement?: ComponentProps<
+    typeof OptimizationsNewPageContent
+  >["savedModelReplacement"];
+  dirtyFields?: Record<string, unknown>;
+} = {}) => {
+  mockUseHandlers.mockReturnValue(
+    makeHandlers({
+      model,
+      optimizerModel,
+      isDatasetError,
+      dirtyFields,
+    }) as unknown as ReturnType<typeof useOptimizationsNewFormHandlers>,
+  );
+
+  return render(
+    <OptimizationsNewPageContent
+      onCancel={vi.fn()}
+      isPreparingDataset={false}
+      availableModels={availableModels}
+      providerKeysReady={providerKeysReady}
+      savedModelReplacement={savedModelReplacement}
+    />,
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+describe("OptimizationsNewPageContent — missing provider key (F1)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("does NOT show the provider-key warning when the selected model is in availableModels", () => {
+    renderContent({
+      model: "openai/gpt-4o",
+      availableModels: ["openai/gpt-4o", "anthropic/claude-3-5-sonnet"],
+      providerKeysReady: true,
+    });
+
+    expect(
+      screen.queryByText(/Add or check the API key for this provider/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the provider-key warning when the model's provider has no configured key", () => {
+    // model is set to anthropic, but only openai is in availableModels
+    renderContent({
+      model: "anthropic/claude-3-5-sonnet",
+      availableModels: ["openai/gpt-4o"],
+      providerKeysReady: true,
+    });
+
+    expect(
+      screen.getByText(/Add or check the API key for this provider/),
+    ).toBeInTheDocument();
+  });
+
+  it("disables the submit button when the provider key is missing", () => {
+    renderContent({
+      model: "anthropic/claude-3-5-sonnet",
+      availableModels: ["openai/gpt-4o"],
+      providerKeysReady: true,
+    });
+
+    const submitBtn = screen.getByRole("button", { name: /Optimize prompt/i });
+    expect(submitBtn).toBeDisabled();
+  });
+
+  it("does NOT show the warning while the keys query is still loading (providerKeysReady=false)", () => {
+    renderContent({
+      model: "anthropic/claude-3-5-sonnet",
+      availableModels: [],
+      providerKeysReady: false,
+    });
+
+    expect(
+      screen.queryByText(/Add or check the API key for this provider/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does NOT show the warning when model is empty (no model selected)", () => {
+    renderContent({
+      model: "",
+      availableModels: ["openai/gpt-4o"],
+      providerKeysReady: true,
+    });
+
+    expect(
+      screen.queryByText(/Add or check the API key for this provider/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the warning when a model is selected but availableModels is empty (stale model after key removal)", () => {
+    // A dirty `model` can survive a provider-key refetch that empties the
+    // provider-backed set. The selected model is no longer backed, so we must
+    // still warn + disable submit rather than let a doomed run through.
+    renderContent({
+      model: "openai/gpt-4o",
+      availableModels: [],
+      providerKeysReady: true,
+    });
+
+    expect(
+      screen.getByText(/Add or check the API key for this provider/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Optimize prompt/i }),
+    ).toBeDisabled();
+  });
+
+  it("the submit button is enabled when the model's provider has a configured key", () => {
+    renderContent({
+      model: "openai/gpt-4o",
+      availableModels: ["openai/gpt-4o"],
+      providerKeysReady: true,
+    });
+
+    const submitBtn = screen.getByRole("button", { name: /Optimize prompt/i });
+    expect(submitBtn).not.toBeDisabled();
+  });
+});
+
+describe("OptimizationsNewPageContent — algorithm model", () => {
+  const ALGORITHM_KEY_WARNING =
+    /Add or check the API key for the algorithm model's provider/;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    {
+      case: "an algorithm model without a configured provider key",
+      optimizerModel: "anthropic/claude-3-5-sonnet",
+      providerKeysReady: true,
+      blocked: true,
+    },
+    {
+      case: "an algorithm model with a configured provider key",
+      optimizerModel: "openai/gpt-4o",
+      providerKeysReady: true,
+      blocked: false,
+    },
+    {
+      case: "no algorithm model (same as prompt)",
+      optimizerModel: "",
+      providerKeysReady: true,
+      blocked: false,
+    },
+    {
+      case: "keys still loading",
+      optimizerModel: "anthropic/claude-3-5-sonnet",
+      providerKeysReady: false,
+      blocked: false,
+    },
+  ])(
+    "blocks Optimize: $blocked, for $case",
+    ({ optimizerModel, providerKeysReady, blocked }) => {
+      renderContent({
+        model: "openai/gpt-4o",
+        availableModels: ["openai/gpt-4o"],
+        optimizerModel,
+        providerKeysReady,
+      });
+
+      expect(screen.queryByText(ALGORITHM_KEY_WARNING) !== null).toBe(blocked);
+      expect(
+        screen.getByRole("button", { name: /Optimize prompt/i }),
+      ).toHaveProperty("disabled", blocked);
+    },
+  );
+});
+
+describe("OptimizationsNewPageContent — replaced saved model", () => {
+  const REPLACEMENT = {
+    savedModel: "openai/r3c-retired-model",
+    replacementModel: "openai/gpt-4o",
+    replacementLabel: "GPT 4o",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("says which model replaced the saved one", () => {
+    renderContent({ savedModelReplacement: REPLACEMENT });
+
+    expect(
+      screen.getByText(
+        "The saved model openai/r3c-retired-model isn't available here, so this run uses GPT 4o with its default settings.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("stops calling the settings defaults once they are edited", () => {
+    renderContent({
+      savedModelReplacement: REPLACEMENT,
+      dirtyFields: { modelConfig: true },
+    });
+
+    expect(
+      screen.getByText(
+        "The saved model openai/r3c-retired-model isn't available here, so this run uses GPT 4o.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("drops the note once another model is picked", () => {
+    renderContent({
+      model: "anthropic/claude-3-5-sonnet",
+      availableModels: ["openai/gpt-4o", "anthropic/claude-3-5-sonnet"],
+      savedModelReplacement: REPLACEMENT,
+    });
+
+    expect(screen.queryByText(/The saved model/)).not.toBeInTheDocument();
+  });
+
+  it("asks for a model when nothing could replace the saved one", () => {
+    renderContent({
+      model: "",
+      availableModels: [],
+      savedModelReplacement: {
+        ...REPLACEMENT,
+        replacementModel: "",
+        replacementLabel: "",
+      },
+    });
+
+    expect(
+      screen.getByText(
+        "The saved model openai/r3c-retired-model isn't available here. Pick a model to run.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows no note for a run whose saved model is kept", () => {
+    renderContent();
+
+    expect(screen.queryByText(/The saved model/)).not.toBeInTheDocument();
+  });
+});

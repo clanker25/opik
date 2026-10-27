@@ -1,0 +1,321 @@
+import { test, expect } from '@playwright/test';
+import type { Page, Locator } from '@playwright/test';
+import { loadEnvConfig } from '../config/env.config';
+import { ItemReturnNav } from './item-return-nav.page';
+import { PlaygroundPage } from './playground.page';
+import { VersionRecordsSidebarPage } from './version-records-sidebar.page';
+
+/**
+ * Per-suite items page. The underlying FE component is shared with DatasetItemsPage
+ * (both routes resolve to the same DatasetDetailPage React component, discriminated
+ * by URL prefix). Mechanics for items add/delete + draft staging are identical;
+ * the surface difference is the "Run in" header dropdown and the
+ * "<N> global assertions" pill.
+ */
+export class TestSuiteItemsPage {
+  constructor(
+    private readonly page: Page,
+    private readonly projectId: string,
+    private readonly suiteId: string,
+  ) {}
+
+  async goto(): Promise<void> {
+    return test.step('Open test-suite items page', async () => {
+      const env = loadEnvConfig();
+      await this.page.goto(
+        `${env.baseUrl}/${env.workspace}/projects/${this.projectId}/test-suites/${this.suiteId}/items`,
+      );
+    });
+  }
+
+  /**
+   * Open the suite items page the way the evaluation-suite item sidebar's
+   * "View evaluation item" link does: with the originating compare view in
+   * `from`, and optionally a `row` to expand.
+   *
+   * Mirror of `DatasetItemsPage.gotoWithReturn` — same header component, same
+   * `from` contract, different route prefix. See that method for why `from` is
+   * written by hand and why an unwanted `row` is omitted rather than blanked.
+   */
+  async gotoWithReturn(opts: { from?: string | null; row?: string } = {}): Promise<void> {
+    return test.step('Open test-suite items page with a return href', async () => {
+      const env = loadEnvConfig();
+      const url = new URL(
+        `${env.baseUrl}/${env.workspace}/projects/${this.projectId}/test-suites/${this.suiteId}/items`,
+      );
+      if (opts.row) url.searchParams.set('row', opts.row);
+      if (opts.from) url.searchParams.set('from', opts.from);
+      await this.page.goto(url.toString());
+    });
+  }
+
+  async waitForReady(): Promise<void> {
+    return test.step('Wait for Test cases tab ready', async () => {
+      await this.page.getByRole('tab', { name: 'Test cases', selected: true }).waitFor({ state: 'visible' });
+      const realRow = this.itemsTableBody.locator('tr[data-row-id]').first();
+      const emptyState = this.page.getByText('No test cases yet');
+      await Promise.race([
+        realRow.waitFor({ state: 'visible' }),
+        emptyState.waitFor({ state: 'visible' }),
+      ]);
+    });
+  }
+
+  /** Rendered row count on the current page. */
+  async countItems(): Promise<number> {
+    return test.step('Read test-suite item count', async () => {
+      return this.itemsTableBody.locator('tr[data-row-id]').count();
+    });
+  }
+
+  /** Read the global-assertions count from the header pill (test-suite-only pill). */
+  async countGlobalAssertions(): Promise<number> {
+    return test.step('Read global-assertions count', async () => {
+      const pill = this.page.getByTestId('dataset-detail-global-assertions-pill');
+      if ((await pill.count()) === 0) return 0;
+      const value = await pill.first().getAttribute('data-count');
+      return parseInt(value ?? '0', 10);
+    });
+  }
+
+  /** Read the version label (e.g. "v1", "v2") from the header. */
+  async readVersionLabel(): Promise<string> {
+    return test.step('Read version label', async () => {
+      const tag = this.page.getByTestId('dataset-detail-version-label');
+      await tag.waitFor({ state: 'visible' });
+      return (await tag.textContent())?.trim() ?? '';
+    });
+  }
+
+  /** Every rendered test-case row — see `DatasetItemsPage.itemRows`. */
+  itemRows(): Locator {
+    return this.itemsTableBody.locator('tr[data-row-id]');
+  }
+
+  itemRow(index: number): Locator {
+    return this.itemsTableBody.locator('tr[data-row-id]').nth(index);
+  }
+
+  itemRowById(id: string): Locator {
+    return this.itemsTableBody.locator(`tr[data-row-id="${id}"]`);
+  }
+
+  /**
+   * The test-suite item ids the grid is currently rendering, in row order.
+   *
+   * Mirrors `DatasetItemsPage.itemRowIds`. Identity matters more here than on
+   * the dataset page: the Test cases table renders only ID / Tags / Created,
+   * so two items with identical `data` are indistinguishable by cell text and
+   * `data-row-id` is the only thing that tells them apart. Single page only —
+   * the table paginates at 10 by default.
+   */
+  async itemRowIds(): Promise<string[]> {
+    return test.step('Read rendered test-suite item ids', async () => {
+      return this.itemsTableBody
+        .locator('tr[data-row-id]')
+        .evaluateAll((rows) => rows.map((r) => r.getAttribute('data-row-id') ?? ''));
+    });
+  }
+
+  draftBadge(): Locator {
+    return this.page.getByText('Draft', { exact: true });
+  }
+
+  /**
+   * Back to the first tab: the suite's live test cases, always the latest
+   * version. Mirrors `DatasetItemsPage.openRecords` — `waitForReady` already
+   * waits on this tab being the selected one, so returning to it is the same
+   * click plus the same wait.
+   */
+  async openTestCases(): Promise<void> {
+    return test.step('Open the Test cases tab', async () => {
+      await this.page.getByRole('tab', { name: 'Test cases' }).click();
+      await this.waitForReady();
+    });
+  }
+
+  /**
+   * Second tab of the suite page: one row per committed version. Mirrors
+   * `DatasetItemsPage.openVersionHistory` — the tab is the same shared
+   * component, and a suite's rows differ only in what the sheet they open
+   * renders.
+   */
+  async openVersionHistory(): Promise<void> {
+    return test.step('Open the Version history tab', async () => {
+      await this.page.getByRole('tab', { name: 'Version history' }).click();
+      const realRow = this.versionsTableBody.locator('tr[data-row-id]').first();
+      const emptyState = this.page.getByText('No version history yet');
+      await Promise.race([
+        realRow.waitFor({ state: 'visible' }),
+        emptyState.waitFor({ state: 'visible' }),
+      ]);
+    });
+  }
+
+  versionHistoryRow(versionName: string): Locator {
+    return this.versionsTableBody
+      .locator('tr[data-row-id]')
+      .filter({ has: this.page.getByRole('cell', { name: versionName, exact: true }) });
+  }
+
+  /** Open one version's read-only records sheet — see `DatasetItemsPage.openVersionRecords`. */
+  async openVersionRecords(versionName: string): Promise<VersionRecordsSidebarPage> {
+    return test.step(`Open version ${versionName}'s test cases sheet`, async () => {
+      const row = this.versionHistoryRow(versionName);
+      await expect(row).toHaveCount(1);
+      await row.click();
+      const sidebar = new VersionRecordsSidebarPage(this.page);
+      await sidebar.waitForReady();
+      return sidebar;
+    });
+  }
+
+  async clickAddItem(): Promise<void> {
+    return test.step('Open add-item panel', async () => {
+      await this.page.getByTestId('dataset-header-add-button').click();
+      // Wait for the Data JSON editor inside the Add panel to be interactive.
+      // This is more reliable than waitForPanelTransform on a multi-mount testid.
+      await this.addItemPanel.locator('.cm-content').first().waitFor({ state: 'visible' });
+    });
+  }
+
+  /**
+   * Fill the test-suite-item Add panel. The panel has a single "Data" JSON
+   * editor (CodeMirror), not per-column inputs like the dataset items panel.
+   *
+   * Pass the item's data as a Record; this method serializes it to JSON and
+   * types it into the editor.
+   */
+  async fillAddItemPanel(data: Record<string, unknown>): Promise<void> {
+    return test.step('Fill add-item panel', async () => {
+      const editor = this.addItemPanel.locator('.cm-content').first();
+      await editor.click();
+      // Clear placeholder, then type the JSON object.
+      await this.page.keyboard.press('ControlOrMeta+A');
+      await this.page.keyboard.press('Delete');
+      await this.page.keyboard.type(JSON.stringify(data, null, 2));
+    });
+  }
+
+  /** Stages the new item as a draft; commitDraft() persists it as a new version. */
+  async submitAddItemPanel(): Promise<void> {
+    return test.step('Submit add-item panel (stage draft)', async () => {
+      await this.addItemPanel.getByRole('button', { name: 'Save changes' }).click();
+      // The panel slides out — its `Save changes` button becomes hidden when closed.
+      await this.addItemPanel
+        .getByRole('button', { name: 'Save changes' })
+        .waitFor({ state: 'hidden' })
+        .catch(() => {});
+      await this.draftBadge().waitFor({ state: 'visible' });
+    });
+  }
+
+  /** Commits all staged drafts as a new suite version via the confirmation modal. */
+  async commitDraft(opts: { versionNote?: string } = {}): Promise<void> {
+    return test.step('Commit draft as new version', async () => {
+      await this.pageLevelCommitButton().click();
+      const modal = await this.versionCommitModal();
+      await modal.waitFor({ state: 'visible' });
+      if (opts.versionNote !== undefined) {
+        await modal.getByRole('textbox', { name: 'Version note (optional)' }).fill(opts.versionNote);
+      }
+      await modal.getByRole('button', { name: 'Save changes' }).click();
+      await modal.waitFor({ state: 'hidden' });
+      await this.draftBadge().waitFor({ state: 'hidden' });
+    });
+  }
+
+  /**
+   * Open the suite in the Prompt Playground via the "Run in" → "Open in Playground" menu path.
+   *
+   * The confirm dialog "Load test suite into playground" only appears when the
+   * playground already has unsaved state (per UseDatasetDropdown.tsx:60-67).
+   * We handle both: dialog shown OR direct navigation.
+   *
+   * After loadPlayground fires, the URL gains a suite-id query param. Wait
+   * for that signal before returning — bare `/playground` means the load
+   * never happened.
+   */
+  async openInPlayground(): Promise<PlaygroundPage> {
+    return test.step('Open suite in Playground', async () => {
+      await this.page.getByTestId('dataset-header-run-in-trigger').click();
+      await this.page.getByRole('menuitem', { name: /^Open in Playground/ }).click();
+
+      const confirm = this.page.getByRole('dialog', { name: 'Load test suite into playground' });
+      await Promise.race([
+        confirm.waitFor({ state: 'visible', timeout: 5_000 }).then(async () => {
+          await confirm.getByRole('button', { name: 'Load test suite' }).click();
+        }),
+        this.page.waitForURL((url) => url.pathname.endsWith('/playground'), { timeout: 5_000 }),
+      ]).catch(() => {});
+
+      // Wait for the playground to be on the right URL.
+      await this.page.waitForURL((url) => url.pathname.endsWith('/playground'), { timeout: 15_000 });
+      const playground = new PlaygroundPage(this.page, this.projectId);
+      return playground;
+    });
+  }
+
+  get addItemPanel(): Locator {
+    // Two panels share the testid `test-suite-item-panel` (Add + Edit/Detail).
+    // The visible one is whichever currently has translateX(0). We approximate
+    // by looking at the panel that wraps the "Add item" heading or "Save changes" button.
+    return this.page.getByTestId('test-suite-item-panel').filter({
+      has: this.page.getByRole('button', { name: 'Save changes' }),
+    });
+  }
+
+  /**
+   * The DETAIL panel, told apart from the Add panel that shares its testid.
+   *
+   * Discriminated on the "Actions menu" button: the detail panel acts on an
+   * existing item and offers it, the Add panel has nothing to act on and does
+   * not. Chosen over the open/closed CSS transform `addItemPanel` approximates
+   * with, because a transform is mid-animation state and this is identity —
+   * and over position, which would silently swap the two if the mount order
+   * changed.
+   */
+  get detailItemPanel(): Locator {
+    return this.page.getByTestId('test-suite-item-panel').filter({
+      has: this.page.getByRole('button', { name: 'Actions menu' }),
+    });
+  }
+
+  /**
+   * Wait for the item detail panel and return the return-nav controls scoped to
+   * it. Same reason for waiting here as `DatasetItemsPage.itemPanelReturnNav`:
+   * "the Experiment button is absent" is true of every build before the panel
+   * mounts.
+   */
+  async itemPanelReturnNav(): Promise<ItemReturnNav> {
+    return test.step('Wait for the suite item detail panel', async () => {
+      await expect(this.detailItemPanel, 'exactly one open suite item detail panel').toHaveCount(1);
+      await this.detailItemPanel.waitFor({ state: 'visible' });
+      return new ItemReturnNav(this.page, this.detailItemPanel);
+    });
+  }
+
+  /** The return-nav controls for the header alone, with no panel open. */
+  headerReturnNav(): ItemReturnNav {
+    return new ItemReturnNav(this.page, this.detailItemPanel);
+  }
+
+  private get itemsTableBody(): Locator {
+    return this.page.getByRole('tabpanel', { name: 'Test cases' }).locator('tbody');
+  }
+
+  private get versionsTableBody(): Locator {
+    return this.page.getByRole('tabpanel', { name: 'Version history' }).locator('tbody');
+  }
+
+  private pageLevelCommitButton(): Locator {
+    const byTestid = this.page.getByTestId('dataset-items-commit-button');
+    return byTestid.or(this.page.getByRole('button', { name: 'Save changes' })).first();
+  }
+
+  private async versionCommitModal(): Promise<Locator> {
+    const byTestid = this.page.getByTestId('dataset-version-commit-dialog');
+    if ((await byTestid.count()) > 0) return byTestid;
+    return this.page.getByRole('dialog', { name: 'Save changes' });
+  }
+}

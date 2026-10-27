@@ -1,0 +1,817 @@
+package com.comet.opik.domain;
+
+import com.comet.opik.api.InstantToUUIDMapper;
+import com.comet.opik.api.filter.Filter;
+import com.comet.opik.api.filter.TraceThreadField;
+import com.comet.opik.api.metrics.KpiCardRequest.EntityType;
+import com.comet.opik.api.metrics.KpiCardResponse;
+import com.comet.opik.api.metrics.KpiCardResponse.KpiMetric;
+import com.comet.opik.api.metrics.KpiCardResponse.KpiMetricType;
+import com.comet.opik.domain.filter.FilterQueryBuilder;
+import com.comet.opik.domain.filter.FilterStrategy;
+import com.comet.opik.infrastructure.OpikConfiguration;
+import com.comet.opik.infrastructure.db.TransactionTemplateAsync;
+import com.comet.opik.infrastructure.instrumentation.InstrumentAsyncUtils;
+import com.comet.opik.utils.SentinelTranslation;
+import com.google.inject.ImplementedBy;
+import io.r2dbc.spi.Connection;
+import io.r2dbc.spi.Result;
+import io.r2dbc.spi.Statement;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.stringtemplate.v4.ST;
+import reactor.core.publisher.Mono;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+import static com.comet.opik.infrastructure.FilterUtils.getSTWithLogComment;
+import static com.comet.opik.infrastructure.instrumentation.InstrumentAsyncUtils.endSegment;
+import static com.comet.opik.infrastructure.instrumentation.InstrumentAsyncUtils.startSegment;
+import static com.comet.opik.utils.AsyncUtils.makeMonoContextAware;
+
+@ImplementedBy(KpiCardDAOImpl.class)
+public interface KpiCardDAO {
+
+    Mono<KpiCardResponse> getTraceKpiCards(KpiCardCriteria criteria);
+
+    Mono<KpiCardResponse> getSpanKpiCards(KpiCardCriteria criteria);
+
+    Mono<KpiCardResponse> getThreadKpiCards(KpiCardCriteria criteria);
+}
+
+@Slf4j
+@Singleton
+@RequiredArgsConstructor(onConstructor_ = @Inject)
+class KpiCardDAOImpl implements KpiCardDAO {
+
+    private final @NonNull TransactionTemplateAsync template;
+    private final @NonNull InstantToUUIDMapper instantToUUIDMapper;
+    private final @NonNull OpikConfiguration configuration;
+
+    /**
+     * trace_costs buckets the TOTAL_COST KPI into current/previous periods keyed on trace_id (a
+     * UUIDv7 matching the trace id used for the count/error/duration split) and is CROSS JOINed as a
+     * single row, avoiding the per-trace LEFT JOIN whose hash build dominated peak memory on large
+     * projects. Identical results; the trace_id IN (traces_filtered) semijoin is retained. OPIK-7319.
+     */
+    private static final String GET_TRACE_KPI_CARDS = """
+            WITH feedback_scores_deduped AS (
+                SELECT workspace_id,
+                       project_id,
+                       entity_id,
+                       name,
+                       value,
+                       last_updated_at,
+                       author,
+                       source_queue_id
+                FROM (
+                    SELECT workspace_id,
+                           project_id,
+                           entity_id,
+                           name,
+                           value,
+                           last_updated_at,
+                           last_updated_by AS author,
+                           CAST('' AS FixedString(36)) AS source_queue_id
+                    FROM feedback_scores
+                    WHERE entity_type = 'trace'
+                      AND workspace_id = :workspace_id
+                      AND project_id = :project_id
+                      AND entity_id >= :uuid_from_time
+                      <if(uuid_to_time)>AND entity_id \\<= :uuid_to_time<endif>
+                    UNION ALL
+                    SELECT workspace_id,
+                           project_id,
+                           entity_id,
+                           name,
+                           value,
+                           last_updated_at,
+                           author,
+                           source_queue_id
+                    FROM authored_feedback_scores
+                    WHERE entity_type = 'trace'
+                      AND workspace_id = :workspace_id
+                      AND project_id = :project_id
+                      AND entity_id >= :uuid_from_time
+                      <if(uuid_to_time)>AND entity_id \\<= :uuid_to_time<endif>
+                )
+                ORDER BY last_updated_at DESC
+                LIMIT 1 BY workspace_id, project_id, entity_id, name, author, source_queue_id
+             ), feedback_scores_final AS (
+                SELECT
+                    workspace_id,
+                    project_id,
+                    entity_id,
+                    name,
+                    if(count() = 1, any(value), toDecimal64(avg(value), 9)) AS value,
+                    max(last_updated_at) AS last_updated_at
+                FROM feedback_scores_deduped
+                GROUP BY workspace_id, project_id, entity_id, name
+            ), guardrails_agg AS (
+                SELECT
+                    entity_id,
+                    if(sum(failed) > 0, 'failed', 'passed') AS guardrails_result
+                FROM (
+                      SELECT
+                          workspace_id,
+                          project_id,
+                          entity_id,
+                          id,
+                          result = 'failed' AS failed
+                      FROM guardrails
+                      WHERE entity_type = 'trace'
+                      AND workspace_id = :workspace_id
+                      AND project_id = :project_id
+                      ORDER BY (workspace_id, project_id, entity_type, entity_id, id) DESC, last_updated_at DESC
+                      LIMIT 1 BY entity_id, id
+                )
+                GROUP BY workspace_id, project_id, entity_id
+            ),
+            <if(feedback_scores_empty_filters)>
+             fsc AS (SELECT entity_id, COUNT(entity_id) AS feedback_scores_count
+                 FROM (
+                    SELECT *
+                    FROM feedback_scores_final
+                    ORDER BY (workspace_id, project_id, entity_id, name) DESC, last_updated_at DESC
+                    LIMIT 1 BY entity_id, name
+                 )
+                 GROUP BY entity_id
+                 HAVING <feedback_scores_empty_filters>
+            ),
+            <endif>
+            traces_filtered AS (
+                SELECT
+                    id,
+                    duration,
+                    error_info
+                FROM (
+                    SELECT
+                        id,
+                        if(end_time IS NOT NULL AND notEquals(end_time, toDateTime64('1970-01-01 00:00:00.000', 9)) AND start_time IS NOT NULL
+                             AND notEquals(start_time, toDateTime64('1970-01-01 00:00:00.000', 9)),
+                         (dateDiff('microsecond', start_time, end_time) / 1000.0),
+                         NULL) AS duration,
+                        error_info
+                    FROM traces FINAL
+                    <if(guardrails_filters)>
+                    LEFT JOIN guardrails_agg gagg ON gagg.entity_id = traces.id
+                    <endif>
+                    <if(feedback_scores_empty_filters)>
+                    LEFT JOIN fsc ON fsc.entity_id = traces.id
+                    <endif>
+                    WHERE project_id = :project_id
+                    AND workspace_id = :workspace_id
+                    AND id >= :uuid_from_time
+                    <if(uuid_to_time)>AND id \\<= :uuid_to_time<endif>
+                    AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                        >= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC'), 1)))
+                    <if(uuid_to_time)>AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                        \\<= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC'), 1)))<endif>
+                    <if(trace_filters)> AND <trace_filters> <endif>
+                    <if(trace_feedback_scores_filters)>
+                    AND id in (
+                        SELECT
+                            entity_id
+                        FROM (
+                            SELECT *
+                            FROM feedback_scores_final
+                            ORDER BY (workspace_id, project_id, entity_id, name) DESC, last_updated_at DESC
+                            LIMIT 1 BY entity_id, name
+                        )
+                        GROUP BY entity_id
+                        HAVING <trace_feedback_scores_filters>
+                    )
+                    <endif>
+                    <if(feedback_scores_empty_filters)>
+                    AND fsc.feedback_scores_count = 0
+                    <endif>
+                ) AS t
+            ), trace_costs AS (
+                SELECT
+                    SUMIf(cost, trace_id >= :id_current_start<if(uuid_to_time)> AND trace_id \\<= :id_end<endif>) AS current_total_cost,
+                    SUMIf(cost, trace_id >= :id_prior_start AND trace_id \\< :id_current_start) AS previous_total_cost
+                FROM (
+                    SELECT trace_id, sum(total_estimated_cost) AS cost
+                    FROM spans FINAL
+                    WHERE workspace_id = :workspace_id AND project_id = :project_id
+                      AND id >= :uuid_from_time <if(uuid_to_time)>AND id \\<= :uuid_to_time<endif>
+                      AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                          >= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC'), 1)))
+                      <if(uuid_to_time)>AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                          \\<= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC'), 1)))<endif>
+                      AND trace_id IN (SELECT id FROM traces_filtered)
+                      <if(spans_partitioned)>
+                      AND toYYYYMMDD(toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1))) IN (
+                          SELECT DISTINCT toYYYYMMDD(toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1))) FROM spans
+                          WHERE workspace_id = :workspace_id AND project_id = :project_id AND trace_id IN (SELECT id FROM traces_filtered)
+                          AND toYYYYMMDD((toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))) >= toYYYYMMDD((toDate32(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC'), 1)))) <if(uuid_to_time)>AND toYYYYMMDD((toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))) \\<= toYYYYMMDD((toDate32(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC'), 1))))<endif>)
+                      <endif>
+                    GROUP BY trace_id
+                )
+            )
+            SELECT
+                COUNTIf(tf.id >= :id_current_start<if(uuid_to_time)> AND tf.id \\<= :id_end<endif>) AS current_count,
+                COUNTIf(tf.id >= :id_prior_start AND tf.id \\< :id_current_start) AS previous_count,
+                if(COUNTIf(tf.id >= :id_current_start<if(uuid_to_time)> AND tf.id \\<= :id_end<endif>) = 0,
+                    0,
+                    COUNTIf(length(tf.error_info) > 0 AND tf.id >= :id_current_start<if(uuid_to_time)> AND tf.id \\<= :id_end<endif>) * 100.0
+                    / COUNTIf(tf.id >= :id_current_start<if(uuid_to_time)> AND tf.id \\<= :id_end<endif>)) AS current_error_rate,
+                if(COUNTIf(tf.id >= :id_prior_start AND tf.id \\< :id_current_start) = 0,
+                    0,
+                    COUNTIf(length(tf.error_info) > 0 AND tf.id >= :id_prior_start AND tf.id \\< :id_current_start) * 100.0
+                    / COUNTIf(tf.id >= :id_prior_start AND tf.id \\< :id_current_start)) AS previous_error_rate,
+                AVGIf(tf.duration, tf.id >= :id_current_start<if(uuid_to_time)> AND tf.id \\<= :id_end<endif>) AS current_avg_duration,
+                AVGIf(tf.duration, tf.id >= :id_prior_start AND tf.id \\< :id_current_start) AS previous_avg_duration,
+                any(tc.current_total_cost) AS current_total_cost,
+                any(tc.previous_total_cost) AS previous_total_cost
+            FROM traces_filtered tf
+            CROSS JOIN trace_costs tc
+            SETTINGS log_comment = '<log_comment>';
+            """;
+
+    private static final String GET_SPAN_KPI_CARDS = """
+            WITH feedback_scores_deduped AS (
+                SELECT workspace_id,
+                       project_id,
+                       entity_id,
+                       name,
+                       value,
+                       last_updated_at,
+                       author,
+                       source_queue_id
+                FROM (
+                    SELECT workspace_id,
+                           project_id,
+                           entity_id,
+                           name,
+                           value,
+                           last_updated_at,
+                           last_updated_by AS author,
+                           CAST('' AS FixedString(36)) AS source_queue_id
+                    FROM feedback_scores
+                    WHERE entity_type = 'span'
+                      AND workspace_id = :workspace_id
+                      AND project_id = :project_id
+                      AND entity_id >= :uuid_from_time
+                      <if(uuid_to_time)>AND entity_id \\<= :uuid_to_time<endif>
+                    UNION ALL
+                    SELECT workspace_id,
+                           project_id,
+                           entity_id,
+                           name,
+                           value,
+                           last_updated_at,
+                           author,
+                           source_queue_id
+                    FROM authored_feedback_scores
+                    WHERE entity_type = 'span'
+                      AND workspace_id = :workspace_id
+                      AND project_id = :project_id
+                      AND entity_id >= :uuid_from_time
+                      <if(uuid_to_time)>AND entity_id \\<= :uuid_to_time<endif>
+                )
+                ORDER BY last_updated_at DESC
+                LIMIT 1 BY workspace_id, project_id, entity_id, name, author, source_queue_id
+             ), feedback_scores_final AS (
+                SELECT
+                    workspace_id,
+                    project_id,
+                    entity_id,
+                    name,
+                    if(count() = 1, any(value), toDecimal64(avg(value), 9)) AS value,
+                    max(last_updated_at) AS last_updated_at
+                FROM feedback_scores_deduped
+                GROUP BY workspace_id, project_id, entity_id, name
+            ),
+            <if(feedback_scores_empty_filters)>
+             fsc AS (SELECT entity_id, COUNT(entity_id) AS feedback_scores_count
+                 FROM (
+                    SELECT *
+                    FROM feedback_scores_final
+                    ORDER BY (workspace_id, project_id, entity_id, name) DESC, last_updated_at DESC
+                    LIMIT 1 BY entity_id, name
+                 )
+                 GROUP BY entity_id
+                 HAVING <feedback_scores_empty_filters>
+            ),
+            <endif>
+            spans_filtered AS (
+                SELECT
+                    id,
+                    duration,
+                    error_info,
+                    total_estimated_cost
+                FROM (
+                    SELECT
+                        id,
+                        if(end_time IS NOT NULL AND notEquals(end_time, toDateTime64('1970-01-01 00:00:00.000', 9)) AND start_time IS NOT NULL
+                             AND notEquals(start_time, toDateTime64('1970-01-01 00:00:00.000', 9)),
+                         (dateDiff('microsecond', start_time, end_time) / 1000.0),
+                         NULL) AS duration,
+                         error_info,
+                         total_estimated_cost
+                    FROM spans FINAL
+                    <if(feedback_scores_empty_filters)>
+                    LEFT JOIN fsc ON fsc.entity_id = spans.id
+                    <endif>
+                    WHERE project_id = :project_id
+                    AND workspace_id = :workspace_id
+                    AND id >= :uuid_from_time
+                    <if(uuid_to_time)>AND id \\<= :uuid_to_time<endif>
+                    AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                        >= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC'), 1)))
+                    <if(uuid_to_time)>AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                        \\<= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC'), 1)))<endif>
+                    <if(spans_partitioned)>
+                    AND toYYYYMMDD(toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1))) IN (
+                        SELECT DISTINCT toYYYYMMDD(toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1))) FROM spans
+                        WHERE workspace_id = :workspace_id AND project_id = :project_id
+                        AND toYYYYMMDD((toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))) >= toYYYYMMDD((toDate32(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC'), 1)))) <if(uuid_to_time)>AND toYYYYMMDD((toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))) \\<= toYYYYMMDD((toDate32(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC'), 1))))<endif>)
+                    <endif>
+                    <if(span_filters)> AND <span_filters> <endif>
+                    <if(span_feedback_scores_filters)>
+                    AND id in (
+                        SELECT
+                            entity_id
+                        FROM (
+                            SELECT *
+                            FROM feedback_scores_final
+                            ORDER BY (workspace_id, project_id, entity_id, name) DESC, last_updated_at DESC
+                            LIMIT 1 BY entity_id, name
+                        )
+                        GROUP BY entity_id
+                        HAVING <span_feedback_scores_filters>
+                    )
+                    <endif>
+                    <if(feedback_scores_empty_filters)>
+                    AND fsc.feedback_scores_count = 0
+                    <endif>
+                ) AS t
+            )
+            SELECT
+                COUNTIf(id >= :id_current_start<if(uuid_to_time)> AND id \\<= :id_end<endif>) AS current_count,
+                COUNTIf(id >= :id_prior_start AND id \\< :id_current_start) AS previous_count,
+                if(COUNTIf(id >= :id_current_start<if(uuid_to_time)> AND id \\<= :id_end<endif>) = 0,
+                    0,
+                    COUNTIf(length(error_info) > 0 AND id >= :id_current_start<if(uuid_to_time)> AND id \\<= :id_end<endif>) * 100.0
+                    / COUNTIf(id >= :id_current_start<if(uuid_to_time)> AND id \\<= :id_end<endif>)) AS current_error_rate,
+                if(COUNTIf(id >= :id_prior_start AND id \\< :id_current_start) = 0,
+                    0,
+                    COUNTIf(length(error_info) > 0 AND id >= :id_prior_start AND id \\< :id_current_start) * 100.0
+                    / COUNTIf(id >= :id_prior_start AND id \\< :id_current_start)) AS previous_error_rate,
+                AVGIf(duration, id >= :id_current_start<if(uuid_to_time)> AND id \\<= :id_end<endif>) AS current_avg_duration,
+                AVGIf(duration, id >= :id_prior_start AND id \\< :id_current_start) AS previous_avg_duration,
+                SUMIf(total_estimated_cost, id >= :id_current_start<if(uuid_to_time)> AND id \\<= :id_end<endif>) AS current_total_cost,
+                SUMIf(total_estimated_cost, id >= :id_prior_start AND id \\< :id_current_start) AS previous_total_cost
+            FROM spans_filtered
+            SETTINGS log_comment = '<log_comment>';
+            """;
+
+    private static final String GET_THREAD_KPI_CARDS = """
+            WITH traces_final AS (
+                SELECT
+                    *,
+                    -- The period is set per trace, not per thread, so a thread active in both periods counts in each, measured over that
+                    -- period's traces only, exactly as the chart and the thread list for that range do.
+                    id >= :id_current_start AS is_current_period
+                FROM traces FINAL
+                WHERE workspace_id = :workspace_id
+                  AND project_id = :project_id
+                  AND id >= :uuid_from_time <if(uuid_to_time)>AND id \\<= :uuid_to_time<endif>
+                  AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                      >= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC'), 1)))
+                  <if(uuid_to_time)>AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                      \\<= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC'), 1)))<endif>
+                  AND thread_id \\<> ''
+                  -- Source/environment chips filter each trace, not the thread row, so a thread with mixed traces aggregates only its matching ones,
+                  -- as the thread list does (ThreadDAO traces_final_ids). A thread-row filter would count such threads whole and drift from the list.
+                  <if(trace_filters)> AND <trace_filters> <endif>
+            ), trace_threads_final AS (
+                SELECT
+                    workspace_id,
+                    project_id,
+                    thread_id,
+                    id as thread_model_id,
+                    status,
+                    tags,
+                    created_by,
+                    last_updated_by,
+                    created_at,
+                    last_updated_at
+                FROM trace_threads FINAL
+                WHERE workspace_id = :workspace_id
+                AND project_id = :project_id
+                -- Deliberately not narrowed by the window. Membership comes from the traces joined below, not from this row's id: the
+                -- row id is when the row was written, which a backfill or the now() fallback in TraceThreadIdService puts outside the
+                -- traces' window. The sort key starts with thread_id, so a row id range skips no granules, and a thread_id set built
+                -- from the window's traces was measured as a net cost: an extra traces scan for no memory saved (OPIK-8335).
+            ), feedback_scores_deduped AS (
+                SELECT workspace_id,
+                       project_id,
+                       entity_id,
+                       name,
+                       value,
+                       last_updated_at,
+                       author,
+                       source_queue_id
+                FROM (
+                    SELECT
+                        workspace_id,
+                        project_id,
+                        entity_id,
+                        name,
+                        value,
+                        last_updated_at,
+                        last_updated_by AS author,
+                        CAST('' AS FixedString(36)) AS source_queue_id
+                    FROM feedback_scores
+                    WHERE entity_type = 'thread'
+                       AND workspace_id = :workspace_id
+                       AND project_id = :project_id
+                       AND entity_id IN (SELECT thread_model_id FROM trace_threads_final)
+                    UNION ALL
+                    SELECT workspace_id,
+                           project_id,
+                           entity_id,
+                           name,
+                           value,
+                           last_updated_at,
+                           author,
+                           source_queue_id
+                    FROM authored_feedback_scores
+                    WHERE entity_type = 'thread'
+                       AND workspace_id = :workspace_id
+                       AND project_id = :project_id
+                       AND entity_id IN (SELECT thread_model_id FROM trace_threads_final)
+                )
+                ORDER BY last_updated_at DESC
+                LIMIT 1 BY workspace_id, project_id, entity_id, name, author, source_queue_id
+            ), feedback_scores_final AS (
+                SELECT
+                    workspace_id,
+                    project_id,
+                    entity_id,
+                    name,
+                    if(count() = 1, any(value), toDecimal64(avg(value), 9)) AS value,
+                    max(last_updated_at) AS last_updated_at
+                FROM feedback_scores_deduped
+                GROUP BY workspace_id, project_id, entity_id, name
+            ),
+            <if(annotation_queue_filters)>
+            thread_annotation_queue_ids AS (
+                 SELECT thread_id,
+                        groupArray(id) AS annotation_queue_ids
+                 FROM (
+                    SELECT DISTINCT aq.id as id, aqi.item_id as thread_id
+                    FROM annotation_queue_items aqi
+                    JOIN annotation_queues aq ON aq.id = aqi.queue_id
+                    WHERE aq.scope = 'thread'
+                      AND workspace_id = :workspace_id
+                      AND project_id = :project_id
+                 ) AS annotation_queue_ids_with_thread_id
+                 GROUP BY thread_id
+            ),
+            <endif>
+            <if(thread_feedback_scores_empty_filters)>
+               fsc AS (SELECT entity_id, COUNT(entity_id) AS feedback_scores_count
+                 FROM (
+                    SELECT *
+                    FROM feedback_scores_final
+                    ORDER BY (workspace_id, project_id, entity_id, name) DESC, last_updated_at DESC
+                    LIMIT 1 BY entity_id, name
+                 )
+                 GROUP BY entity_id
+                 HAVING <thread_feedback_scores_empty_filters>
+            ),
+            <endif>
+            threads_filtered AS (
+                SELECT
+                    t.workspace_id as workspace_id,
+                    t.project_id as project_id,
+                    t.id as id,
+                    t.is_current_period as is_current_period,
+                    if(tt.created_by = '', t.created_by, tt.created_by) as created_by,
+                    if(tt.last_updated_by = '', t.last_updated_by, tt.last_updated_by) as last_updated_by,
+                    if(tt.last_updated_at == toDateTime64(0, 6, 'UTC'), t.last_updated_at, tt.last_updated_at) as last_updated_at,
+                    if(tt.created_at = toDateTime64(0, 9, 'UTC'), t.created_at, tt.created_at) as created_at,
+                    if(tt.status = 'unknown', 'active', tt.status) as status,
+                    t.duration as duration,
+                    if(LENGTH(CAST(tt.thread_model_id AS Nullable(String))) > 0, tt.thread_model_id, NULL) as thread_model_id,
+                    tt.tags as tags
+                FROM (
+                    SELECT
+                        t.thread_id as id,
+                        t.workspace_id as workspace_id,
+                        t.project_id as project_id,
+                        t.is_current_period as is_current_period,
+                        minIf(t.start_time, notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))) as start_time,
+                        maxIf(t.end_time, notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))) as end_time,
+                        if(maxIf(t.end_time, notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))) IS NOT NULL AND notEquals(maxIf(t.end_time, notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))), toDateTime64('1970-01-01 00:00:00.000', 9)) AND minIf(t.start_time, notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))) IS NOT NULL
+                               AND notEquals(minIf(t.start_time, notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))), toDateTime64('1970-01-01 00:00:00.000', 9)),
+                           (dateDiff('microsecond', minIf(t.start_time, notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))), maxIf(t.end_time, notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9)))) / 1000.0),
+                           NULL) AS duration,
+                        count(DISTINCT t.id) * 2 as number_of_messages,
+                        -- Update-before-create placeholders carry the sentinel start time, so they are skipped while the thread has a real trace.
+                        -- A thread made only of placeholders falls back to them and still shows what the updates carried.
+                        <if(trace_thread_first_message_filter || trace_thread_last_message_filter)>countIf(notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))) > 0 as has_non_sentinel_trace,<endif>
+                        <if(trace_thread_first_message_filter)>if(has_non_sentinel_trace, argMinIf(t.input, t.start_time, notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))), argMin(t.input, t.start_time)) as first_message,<endif>
+                        <if(trace_thread_last_message_filter)>if(has_non_sentinel_trace, argMaxIf(t.output, nullIf(t.end_time, toDateTime64('1970-01-01 00:00:00.000', 9)), notEquals(t.start_time, toDateTime64('1970-01-01 00:00:00.000', 9))), argMax(t.output, nullIf(t.end_time, toDateTime64('1970-01-01 00:00:00.000', 9)))) as last_message,<endif>
+                        max(t.last_updated_at) as last_updated_at,
+                        argMax(t.last_updated_by, t.last_updated_at) as last_updated_by,
+                        argMin(t.created_by, t.created_at) as created_by,
+                        min(t.created_at) as created_at
+                    FROM traces_final AS t
+                    GROUP BY
+                        t.workspace_id, t.project_id, t.thread_id, t.is_current_period
+                ) AS t
+                JOIN trace_threads_final AS tt ON t.id = tt.thread_id
+                <if(annotation_queue_filters)>
+                LEFT JOIN thread_annotation_queue_ids as ttaqi ON ttaqi.thread_id = tt.thread_model_id
+                <endif>
+                WHERE workspace_id = :workspace_id
+                <if(thread_feedback_scores_filters)>
+                AND thread_model_id IN (
+                    SELECT
+                        entity_id
+                    FROM (
+                        SELECT *
+                        FROM feedback_scores_final
+                        ORDER BY (workspace_id, project_id, entity_id, name) DESC, last_updated_at DESC
+                        LIMIT 1 BY entity_id, name
+                    )
+                    GROUP BY entity_id
+                    HAVING <thread_feedback_scores_filters>
+                )
+                <endif>
+                <if(thread_feedback_scores_empty_filters)>
+                AND (
+                    thread_model_id IN (SELECT entity_id FROM fsc WHERE fsc.feedback_scores_count = 0)
+                        OR
+                    thread_model_id NOT IN (SELECT entity_id FROM fsc)
+                )
+                <endif>
+                <if(trace_thread_filters)>AND<trace_thread_filters><endif>
+                <if(annotation_queue_filters)> AND <annotation_queue_filters> <endif>
+            ), thread_costs AS (
+                SELECT tr.thread_id AS thread_id, tr.is_current_period AS is_current_period, sum(s.total_estimated_cost) AS cost
+                FROM (
+                    SELECT trace_id, total_estimated_cost
+                    FROM spans FINAL
+                    WHERE workspace_id = :workspace_id AND project_id = :project_id
+                      AND id >= :uuid_from_time <if(uuid_to_time)>AND id \\<= :uuid_to_time<endif>
+                      AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                          >= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC'), 1)))
+                      <if(uuid_to_time)>AND (toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))
+                          \\<= (toDate32(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC'), 1)))<endif>
+                      <if(spans_partitioned)>
+                      AND toYYYYMMDD(toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1))) IN (
+                          SELECT DISTINCT toYYYYMMDD(toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1))) FROM spans
+                          WHERE workspace_id = :workspace_id AND project_id = :project_id
+                        AND toYYYYMMDD((toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))) >= toYYYYMMDD((toDate32(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_from_time), 'UTC'), 1)))) <if(uuid_to_time)>AND toYYYYMMDD((toDate32(id_at) - toIntervalDay(toDayOfWeek(id_at, 1)))) \\<= toYYYYMMDD((toDate32(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC')) - toIntervalDay(toDayOfWeek(UUIDv7ToDateTime(toUUID(:uuid_to_time), 'UTC'), 1))))<endif>)
+                      <endif>
+                ) s
+                JOIN traces_final tr ON s.trace_id = tr.id
+                GROUP BY tr.thread_id, tr.is_current_period
+            )
+            SELECT
+                COUNTIf(tf.is_current_period) AS current_count,
+                COUNTIf(NOT tf.is_current_period) AS previous_count,
+                AVGIf(tf.duration, tf.is_current_period) AS current_avg_duration,
+                AVGIf(tf.duration, NOT tf.is_current_period) AS previous_avg_duration,
+                SUMIf(tc.cost, tf.is_current_period) AS current_total_cost,
+                SUMIf(tc.cost, NOT tf.is_current_period) AS previous_total_cost
+            FROM threads_filtered tf
+            LEFT JOIN thread_costs tc ON tf.id = tc.thread_id AND tf.is_current_period = tc.is_current_period
+            SETTINGS log_comment = '<log_comment>';
+            """;
+
+    @Override
+    public Mono<KpiCardResponse> getTraceKpiCards(@NonNull KpiCardCriteria criteria) {
+        return template.nonTransaction(connection -> makeMonoContextAware((userName, workspaceId) -> {
+            var st = buildTemplate(GET_TRACE_KPI_CARDS, criteria, workspaceId, "getTraceKpiCards");
+
+            addTraceFilters(st, criteria.filters());
+
+            var statement = bindPeriodBounds(buildStatement(connection, st, criteria, workspaceId), criteria);
+            bindTraceFilters(statement, criteria.filters());
+
+            InstrumentAsyncUtils.Segment segment = startSegment("traceKpiCards", "Clickhouse", "kpi");
+
+            return Mono.from(statement.execute())
+                    .flatMap(r -> mapResult(r, EntityType.TRACES))
+                    .doFinally(signalType -> endSegment(segment));
+        }));
+    }
+
+    @Override
+    public Mono<KpiCardResponse> getSpanKpiCards(@NonNull KpiCardCriteria criteria) {
+        return template.nonTransaction(connection -> makeMonoContextAware((userName, workspaceId) -> {
+            var st = buildTemplate(GET_SPAN_KPI_CARDS, criteria, workspaceId, "getSpanKpiCards");
+
+            addSpanFilters(st, criteria.filters());
+
+            var statement = bindPeriodBounds(buildStatement(connection, st, criteria, workspaceId), criteria);
+            bindSpanFilters(statement, criteria.filters());
+
+            InstrumentAsyncUtils.Segment segment = startSegment("spanKpiCards", "Clickhouse", "kpi");
+
+            return Mono.from(statement.execute())
+                    .flatMap(r -> mapResult(r, EntityType.SPANS))
+                    .doFinally(signalType -> endSegment(segment));
+        }));
+    }
+
+    @Override
+    public Mono<KpiCardResponse> getThreadKpiCards(@NonNull KpiCardCriteria criteria) {
+        return template.nonTransaction(connection -> makeMonoContextAware((userName, workspaceId) -> {
+            var st = buildTemplate(GET_THREAD_KPI_CARDS, criteria, workspaceId, "getThreadKpiCards");
+
+            addThreadFilters(st, criteria.filters());
+
+            var statement = buildStatement(connection, st, criteria, workspaceId);
+            bindThreadFilters(statement, criteria.filters());
+
+            InstrumentAsyncUtils.Segment segment = startSegment("threadKpiCards", "Clickhouse", "kpi");
+
+            return Mono.from(statement.execute())
+                    .flatMap(r -> mapResult(r, EntityType.THREADS))
+                    .doFinally(signalType -> endSegment(segment));
+        }));
+    }
+
+    private ST buildTemplate(String query, KpiCardCriteria criteria, String workspaceId,
+            String queryName) {
+        var template = getSTWithLogComment(query, "KpiCards_" + queryName, workspaceId, "",
+                criteria.projectId().toString());
+        // The span reads' upper bound is open without a requested end, so on the weekly-partitioned spans they carry
+        // the weeks their own matching span ids resolve to; on the legacy table there is nothing to prune.
+        if (spanColumnsNonNullable()) {
+            template.add("spans_partitioned", true);
+        }
+        // Without a requested end the upper bounds are omitted, so far-future ids count, as they do in the list.
+        if (criteria.intervalEnd() != null) {
+            template.add("uuid_to_time", true);
+        }
+        return template;
+    }
+
+    private Statement buildStatement(Connection connection, ST template,
+            KpiCardCriteria criteria, String workspaceId) {
+        // Without a requested end, now only sizes the prior period; the current one is open-ended.
+        Instant priorStart = getPriorStart(criteria.intervalStart(),
+                Optional.ofNullable(criteria.intervalEnd()).orElseGet(Instant::now));
+
+        var statement = connection.createStatement(template.render())
+                .bind("project_id", criteria.projectId())
+                .bind("workspace_id", workspaceId)
+                .bind("uuid_from_time", instantToUUIDMapper.toLowerBound(priorStart).toString())
+                .bind("id_current_start", instantToUUIDMapper.toLowerBound(criteria.intervalStart()).toString());
+        if (criteria.intervalEnd() != null) {
+            statement.bind("uuid_to_time", instantToUUIDMapper.toUpperBound(criteria.intervalEnd()).toString());
+        }
+        return statement;
+    }
+
+    private Statement bindPeriodBounds(Statement statement, KpiCardCriteria criteria) {
+        Instant priorStart = getPriorStart(criteria.intervalStart(),
+                Optional.ofNullable(criteria.intervalEnd()).orElseGet(Instant::now));
+
+        statement.bind("id_prior_start", instantToUUIDMapper.toLowerBound(priorStart).toString());
+        if (criteria.intervalEnd() != null) {
+            statement.bind("id_end", instantToUUIDMapper.toUpperBound(criteria.intervalEnd()).toString());
+        }
+        return statement;
+    }
+
+    private void addTraceFilters(ST template, List<? extends Filter> filters) {
+        Optional.ofNullable(filters).ifPresent(f -> {
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.TRACE, traceColumnsNonNullable())
+                    .ifPresent(traceFilters -> template.add("trace_filters", traceFilters));
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.FEEDBACK_SCORES)
+                    .ifPresent(scoresFilters -> template.add("trace_feedback_scores_filters", scoresFilters));
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.FEEDBACK_SCORES_IS_EMPTY)
+                    .ifPresent(emptyFilters -> template.add("feedback_scores_empty_filters", emptyFilters));
+            FilterQueryBuilder.hasGuardrailsFilter(f)
+                    .ifPresent(hasGuardrails -> template.add("guardrails_filters", true));
+        });
+    }
+
+    private boolean traceColumnsNonNullable() {
+        return configuration.getDatabaseAnalyticsDataModel().traceColumnsNonNullable();
+    }
+
+    private boolean spanColumnsNonNullable() {
+        return configuration.getDatabaseAnalyticsDataModel().spanColumnsNonNullable();
+    }
+
+    private void bindTraceFilters(Statement statement, List<? extends Filter> filters) {
+        Optional.ofNullable(filters).ifPresent(f -> {
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.TRACE);
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.FEEDBACK_SCORES);
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.FEEDBACK_SCORES_IS_EMPTY);
+        });
+    }
+
+    private void addSpanFilters(ST template, List<? extends Filter> filters) {
+        Optional.ofNullable(filters).ifPresent(f -> {
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.SPAN, spanColumnsNonNullable())
+                    .ifPresent(spanFilters -> template.add("span_filters", spanFilters));
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.SPAN_FEEDBACK_SCORES)
+                    .ifPresent(scoresFilters -> template.add("span_feedback_scores_filters", scoresFilters));
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.SPAN_FEEDBACK_SCORES_IS_EMPTY)
+                    .ifPresent(emptyFilters -> template.add("feedback_scores_empty_filters", emptyFilters));
+        });
+    }
+
+    private void bindSpanFilters(Statement statement, List<? extends Filter> filters) {
+        Optional.ofNullable(filters).ifPresent(f -> {
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.SPAN);
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.SPAN_FEEDBACK_SCORES);
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.SPAN_FEEDBACK_SCORES_IS_EMPTY);
+        });
+    }
+
+    private void addThreadFilters(ST template, List<? extends Filter> filters) {
+        Optional.ofNullable(filters).ifPresent(f -> {
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.TRACE, traceColumnsNonNullable())
+                    .ifPresent(traceFilters -> template.add("trace_filters", traceFilters));
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.TRACE_THREAD, traceColumnsNonNullable())
+                    .ifPresent(threadFilters -> template.add("trace_thread_filters", threadFilters));
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.ANNOTATION_AGGREGATION)
+                    .ifPresent(annotationQueueFilters -> template.add("annotation_queue_filters",
+                            annotationQueueFilters));
+            // first_message/last_message aggregate the full input/output payloads, so only project
+            // them in threads_filtered when a filter actually references them (otherwise the thread
+            // KPI query would needlessly materialize large columns). number_of_messages is cheap and
+            // always projected. See OPIK-7050.
+            FilterQueryBuilder.hasField(f, TraceThreadField.FIRST_MESSAGE)
+                    .ifPresent(present -> template.add("trace_thread_first_message_filter", true));
+            FilterQueryBuilder.hasField(f, TraceThreadField.LAST_MESSAGE)
+                    .ifPresent(present -> template.add("trace_thread_last_message_filter", true));
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.FEEDBACK_SCORES)
+                    .ifPresent(scoresFilters -> template.add("thread_feedback_scores_filters", scoresFilters));
+            FilterQueryBuilder.toAnalyticsDbFilters(f, FilterStrategy.FEEDBACK_SCORES_IS_EMPTY)
+                    .ifPresent(emptyFilters -> template.add("thread_feedback_scores_empty_filters", emptyFilters));
+        });
+    }
+
+    private void bindThreadFilters(Statement statement, List<? extends Filter> filters) {
+        Optional.ofNullable(filters).ifPresent(f -> {
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.TRACE);
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.TRACE_THREAD);
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.ANNOTATION_AGGREGATION);
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.FEEDBACK_SCORES);
+            FilterQueryBuilder.bind(statement, f, FilterStrategy.FEEDBACK_SCORES_IS_EMPTY);
+        });
+    }
+
+    private Mono<KpiCardResponse> mapResult(Result result, EntityType entityType) {
+        return Mono.from(result.map((row, metadata) -> {
+            var stats = new ArrayList<KpiMetric>();
+
+            stats.add(KpiMetric.builder()
+                    .type(KpiMetricType.COUNT)
+                    .currentValue(filterNan(row.get("current_count", Double.class)))
+                    .previousValue(filterNan(row.get("previous_count", Double.class)))
+                    .build());
+
+            stats.add(KpiMetric.builder()
+                    .type(KpiMetricType.AVG_DURATION)
+                    .currentValue(filterNan(row.get("current_avg_duration", Double.class)))
+                    .previousValue(filterNan(row.get("previous_avg_duration", Double.class)))
+                    .build());
+
+            stats.add(KpiMetric.builder()
+                    .type(KpiMetricType.TOTAL_COST)
+                    .currentValue(filterNan(row.get("current_total_cost", Double.class)))
+                    .previousValue(filterNan(row.get("previous_total_cost", Double.class)))
+                    .build());
+
+            if (entityType != EntityType.THREADS) {
+                stats.add(KpiMetric.builder()
+                        .type(KpiMetricType.ERRORS)
+                        .currentValue(filterNan(row.get("current_error_rate", Double.class)))
+                        .previousValue(filterNan(row.get("previous_error_rate", Double.class)))
+                        .build());
+            }
+
+            return KpiCardResponse.builder().stats(stats).build();
+        }));
+    }
+
+    private Instant getPriorStart(Instant intervalStart, Instant intervalEnd) {
+        Duration duration = Duration.between(intervalStart, intervalEnd);
+        return intervalStart.minus(duration);
+    }
+
+    private Double filterNan(Double value) {
+        return SentinelTranslation.nanToNull(value);
+    }
+}

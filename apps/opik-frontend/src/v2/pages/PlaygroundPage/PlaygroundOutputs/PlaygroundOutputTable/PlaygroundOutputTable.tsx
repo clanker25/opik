@@ -1,0 +1,266 @@
+import React, { useMemo, useCallback } from "react";
+import get from "lodash/get";
+import isEmpty from "lodash/isEmpty";
+import { ColumnDef } from "@tanstack/react-table";
+import useLocalStorageState from "use-local-storage-state";
+import { Resizable } from "re-resizable";
+import { GripVertical } from "lucide-react";
+
+import StickyScrollTable from "@/v2/pages/PlaygroundPage/PlaygroundOutputs/PlaygroundOutputTable/StickyScrollTable";
+import { DatasetItem, DatasetItemColumn } from "@/types/datasets";
+import { COLUMN_TYPE, ColumnData, ROW_HEIGHT } from "@/types/shared";
+import { mapDynamicColumnTypesToColumnType } from "@/lib/filters";
+
+import { convertColumnDataToColumn, sortColumnsByOrder } from "@/lib/table";
+import { getAlphabetLetter } from "@/lib/utils";
+import PlaygroundOutputCell from "@/v2/pages/PlaygroundPage/PlaygroundOutputs/PlaygroundOutputTable/PlaygroundOutputCell";
+import PlaygroundOutputColumnHeader from "@/v2/pages/PlaygroundPage/PlaygroundOutputs/PlaygroundOutputTable/PlaygroundOutputColumnHeader";
+import PlaygroundVariableCell from "@/v2/pages/PlaygroundPage/PlaygroundOutputs/PlaygroundOutputTable/PlaygroundVariableCell";
+import DataTableNoData from "@/shared/DataTableNoData/DataTableNoData";
+import { EXPLAINER_ID, EXPLAINERS_MAP } from "@/v2/constants/explainers";
+import { useIncrementalDatasetHydration } from "@/v2/pages/PlaygroundPage/useIncrementalDatasetHydration";
+import PlaygroundTagsCell from "@/v2/pages/PlaygroundPage/PlaygroundOutputs/PlaygroundOutputTable/PlaygroundTagsCell";
+import usePlaygroundColumnsSettings, {
+  getVariableColumnId,
+  TAGS_COLUMN_ID,
+} from "@/v2/pages/PlaygroundPage/PlaygroundOutputs/PlaygroundOutputTable/usePlaygroundColumnsSettings";
+import {
+  PLAYGROUND_OUTPUT_COLUMNS_WIDTH_KEY,
+  PLAYGROUND_OUTPUT_LEFT_PANEL_WIDTH_KEY,
+} from "@/constants/llm";
+
+type PlaygroundOutputTableData = {
+  variables: { [key: string]: string };
+  tags: string[];
+};
+
+interface PlaygroundOutputTableProps {
+  datasetId: string;
+  datasetItems: DatasetItem[];
+  datasetColumns: DatasetItemColumn[];
+  promptIds: string[];
+  isLoadingDatasetItems: boolean;
+  isFetchingData: boolean;
+}
+
+const DEFAULT_LEFT_WIDTH = "50%";
+const MIN_LEFT_WIDTH = "10%";
+const MAX_LEFT_WIDTH = "90%";
+
+const PlaygroundOutputTable = ({
+  datasetId,
+  datasetItems,
+  promptIds,
+  datasetColumns,
+  isLoadingDatasetItems,
+  isFetchingData,
+}: PlaygroundOutputTableProps) => {
+  const [columnsWidth, setColumnsWidth] = useLocalStorageState<
+    Record<string, number>
+  >(PLAYGROUND_OUTPUT_COLUMNS_WIDTH_KEY, {
+    defaultValue: {},
+  });
+
+  const [leftPanelWidth, setLeftPanelWidth] = useLocalStorageState<
+    string | number
+  >(PLAYGROUND_OUTPUT_LEFT_PANEL_WIDTH_KEY, {
+    defaultValue: DEFAULT_LEFT_WIDTH,
+  });
+
+  const hydratedDatasetItems = useIncrementalDatasetHydration(datasetItems);
+
+  const noDataMessage = isLoadingDatasetItems
+    ? "Loading..."
+    : "No dataset items";
+
+  const rows = useMemo(() => {
+    if (isLoadingDatasetItems) {
+      return [];
+    }
+
+    return hydratedDatasetItems.map((di) => ({
+      id: di.id,
+      dataItemId: di.id,
+      variables: {
+        ...di.data,
+      },
+      tags: di.tags || [],
+    }));
+  }, [hydratedDatasetItems, isLoadingDatasetItems]);
+
+  const inputColumnsData = useMemo(() => {
+    if (isEmpty(datasetColumns)) {
+      return [];
+    }
+
+    const explainer =
+      EXPLAINERS_MAP[
+        EXPLAINER_ID.how_do_i_use_the_test_suite_in_the_playground
+      ];
+
+    const inputColumns = [...datasetColumns]
+      .sort((c1, c2) => c1.name.localeCompare(c2.name))
+      .map(
+        (c) =>
+          ({
+            id: getVariableColumnId(c.name),
+            label: c.name,
+            type: mapDynamicColumnTypesToColumnType(c.types),
+            accessorFn: (row) => get(row, ["variables", c.name], ""),
+            cell: PlaygroundVariableCell as never,
+            explainer: {
+              ...explainer,
+              description: explainer.description + `{{${c.name}}}`,
+            },
+          }) as ColumnData<PlaygroundOutputTableData>,
+      );
+
+    inputColumns.push({
+      id: TAGS_COLUMN_ID,
+      label: "Tags",
+      type: COLUMN_TYPE.list,
+      iconType: "tags",
+      accessorFn: (row) => row.tags || [],
+      cell: PlaygroundTagsCell as never,
+    } as ColumnData<PlaygroundOutputTableData>);
+
+    return inputColumns;
+  }, [datasetColumns]);
+
+  const inputColumnIds = useMemo(
+    () => inputColumnsData.map(({ id }) => id),
+    [inputColumnsData],
+  );
+
+  const { selectedColumns, columnsOrder } = usePlaygroundColumnsSettings(
+    datasetId,
+    inputColumnIds,
+  );
+
+  const leftColumns = useMemo(() => {
+    const firstVisibleColumnId = sortColumnsByOrder(
+      inputColumnsData,
+      columnsOrder,
+    ).find(({ id }) => selectedColumns.includes(id))?.id;
+
+    return convertColumnDataToColumn<
+      PlaygroundOutputTableData,
+      PlaygroundOutputTableData
+    >(
+      inputColumnsData.map((column) => ({
+        ...column,
+        customMeta: { showIndex: column.id === firstVisibleColumnId },
+      })),
+      { columnsOrder, selectedColumns },
+    );
+  }, [inputColumnsData, columnsOrder, selectedColumns]);
+
+  const rightColumns = useMemo(() => {
+    if (promptIds.length === 0) {
+      return [];
+    }
+
+    const retVal: ColumnDef<PlaygroundOutputTableData>[] = [];
+
+    const outputColumns = promptIds.map((promptId, promptIdx) => {
+      return {
+        id: `output-${promptId}`,
+        label: `Prompt ${getAlphabetLetter(promptIdx)}`,
+        type: COLUMN_TYPE.string,
+        header: PlaygroundOutputColumnHeader as never,
+        cell: PlaygroundOutputCell as never,
+        minSize: 350,
+        customMeta: {
+          promptId: promptId,
+          promptIndex: promptIdx,
+        },
+      } as ColumnData<PlaygroundOutputTableData>;
+    });
+
+    retVal.push(
+      ...convertColumnDataToColumn<
+        PlaygroundOutputTableData,
+        PlaygroundOutputTableData
+      >(outputColumns, {}),
+    );
+
+    return retVal;
+  }, [promptIds]);
+
+  const resizeConfig = useMemo(
+    () => ({
+      enabled: true,
+      columnSizing: columnsWidth,
+      onColumnResize: setColumnsWidth,
+    }),
+    [columnsWidth, setColumnsWidth],
+  );
+
+  const handleResizeStop = useCallback(
+    (_e: unknown, _direction: unknown, ref: HTMLElement) => {
+      setLeftPanelWidth(ref.offsetWidth);
+    },
+    [setLeftPanelWidth],
+  );
+
+  const hasLeftColumns = leftColumns.length > 0;
+  const hasRightColumns = rightColumns.length > 0;
+
+  if (!hasLeftColumns && !hasRightColumns) {
+    return null;
+  }
+
+  return (
+    <div
+      className="playground-table flex" // eslint-disable-line tailwindcss/no-custom-classname
+      style={{ "--cell-top-height": "28px" } as React.CSSProperties}
+    >
+      {hasLeftColumns && (
+        <Resizable
+          size={{ width: leftPanelWidth, height: "auto" }}
+          minWidth={MIN_LEFT_WIDTH}
+          maxWidth={MAX_LEFT_WIDTH}
+          enable={{ right: true }}
+          onResizeStop={handleResizeStop}
+          handleComponent={{
+            right: (
+              <div className="flex h-full w-[13px] justify-center border-x border-b hover:bg-gray-100">
+                <GripVertical className="sticky top-4 z-10 mt-4 size-3 text-light-slate" />
+              </div>
+            ),
+          }}
+          handleStyles={{ right: { right: 0, width: 1, zIndex: 10 } }}
+          className="mr-3 shrink-0"
+        >
+          <div className="h-full">
+            <StickyScrollTable
+              columns={leftColumns}
+              data={rows}
+              rowHeight={ROW_HEIGHT.large}
+              resizeConfig={resizeConfig}
+              noData={<DataTableNoData title={noDataMessage} />}
+              showLoadingOverlay={isFetchingData}
+              testId="playground-variables-table"
+            />
+          </div>
+        </Resizable>
+      )}
+
+      {hasRightColumns && (
+        <div className="min-w-0 flex-1">
+          <StickyScrollTable
+            columns={rightColumns}
+            data={rows}
+            rowHeight={ROW_HEIGHT.large}
+            resizeConfig={resizeConfig}
+            noData={<DataTableNoData title={noDataMessage} />}
+            showLoadingOverlay={isFetchingData}
+            testId="playground-outputs-table"
+          />
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default PlaygroundOutputTable;

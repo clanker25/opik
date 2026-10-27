@@ -1,0 +1,51 @@
+import logging
+from typing import List, Optional
+
+from openai.types import responses as openai_responses
+
+import opik.logging_messages as logging_messages
+
+LOGGER = logging.getLogger(__name__)
+
+
+def aggregate(
+    items: List[openai_responses.ResponseStreamEvent],
+) -> Optional[openai_responses.Response]:
+    try:
+        completed_event = [
+            event
+            for event in items
+            if isinstance(
+                event,
+                (
+                    openai_responses.ResponseCompletedEvent,
+                    openai_responses.ResponseErrorEvent,
+                    openai_responses.ResponseIncompleteEvent,
+                    openai_responses.ResponseFailedEvent,
+                ),
+            )
+        ]
+
+        if not completed_event:
+            # The stream was abandoned before its terminal event (a `break`, a
+            # cancelled task, a client disconnect): there is no response to log.
+            LOGGER.debug(
+                "No terminal event among %d OpenAI Responses stream items, "
+                "stream output is not recorded",
+                len(items),
+            )
+            return None
+
+        for event in completed_event:
+            response = getattr(event, "response", None)
+            if response is not None:
+                return response
+
+        return None
+    except Exception as exception:
+        LOGGER.error(
+            logging_messages.FAILED_TO_PARSE_OPENAI_STREAM_CONTENT,
+            str(exception),
+            exc_info=True,
+        )
+        return None

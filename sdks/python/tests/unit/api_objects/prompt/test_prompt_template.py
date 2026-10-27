@@ -1,0 +1,220 @@
+import pytest
+from jinja2.exceptions import SecurityError
+from opik.api_objects.prompt import PromptTemplate, PromptType
+from opik import exceptions
+
+
+def test_prompt__format__happyflow():
+    PROMPT_TEMPLATE = "Hi, my name is {{name}}, I live in {{city}}."
+
+    tested = PromptTemplate(PROMPT_TEMPLATE)
+
+    result = tested.format(name="Harry", city="London")
+    assert result == "Hi, my name is Harry, I live in London."
+
+
+def test_prompt__format__one_placeholder_used_multiple_times():
+    PROMPT_TEMPLATE = (
+        "Hi, my name is {{name}}, I live in {{city}}. I repeat, my name is {{name}}"
+    )
+
+    tested = PromptTemplate(PROMPT_TEMPLATE)
+
+    result = tested.format(name="Harry", city="London")
+    assert (
+        result == "Hi, my name is Harry, I live in London. I repeat, my name is Harry"
+    )
+
+
+def test_prompt__format__passed_arguments_that_are_not_in_template__error_raised_with_correct_report_info():
+    PROMPT_TEMPLATE = "Hi, my name is {{name}}, I live in {{city}}."
+
+    tested = PromptTemplate(PROMPT_TEMPLATE)
+
+    with pytest.raises(
+        exceptions.PromptPlaceholdersDontMatchFormatArguments
+    ) as exc_info:
+        tested.format(name="Harry", city="London", nemesis_name="Voldemort")
+
+    assert exc_info.value.format_arguments == set(["name", "city", "nemesis_name"])
+    assert exc_info.value.prompt_placeholders == set(
+        [
+            "name",
+            "city",
+        ]
+    )
+    assert exc_info.value.symmetric_difference == set(["nemesis_name"])
+
+
+def test_prompt__format__some_placeholders_dont_have_corresponding_format_arguments__error_raised_with_correct_report_info():
+    PROMPT_TEMPLATE = "Hi, my name is {{name}}, I live in {{city}}."
+
+    tested = PromptTemplate(PROMPT_TEMPLATE)
+
+    with pytest.raises(
+        exceptions.PromptPlaceholdersDontMatchFormatArguments
+    ) as exc_info:
+        tested.format(name="Harry")
+
+    assert exc_info.value.format_arguments == set(["name"])
+    assert exc_info.value.prompt_placeholders == set(["name", "city"])
+    assert exc_info.value.symmetric_difference == set(["city"])
+
+
+def test_prompt__format__some_placeholders_dont_have_corresponding_format_arguments_AND_there_are_format_arguments_that_are_not_in_the_template__error_raised_with_correct_report_info():
+    PROMPT_TEMPLATE = "Hi, my name is {{name}}, I live in {{city}}."
+
+    tested = PromptTemplate(PROMPT_TEMPLATE)
+
+    with pytest.raises(
+        exceptions.PromptPlaceholdersDontMatchFormatArguments
+    ) as exc_info:
+        tested.format(name="Harry", nemesis_name="Voldemort")
+
+    assert exc_info.value.format_arguments == set(["name", "nemesis_name"])
+    assert exc_info.value.prompt_placeholders == set(["name", "city"])
+    assert exc_info.value.symmetric_difference == set(["city", "nemesis_name"])
+
+
+def test_prompt__format_jinja2__happyflow():
+    PROMPT_TEMPLATE = "Hi, my name is {{ name }}, I live in {{ city }}."
+
+    tested = PromptTemplate(PROMPT_TEMPLATE, type=PromptType.JINJA2)
+
+    result = tested.format(name="Harry", city="London")
+    assert result == "Hi, my name is Harry, I live in London."
+
+
+def test_prompt__format_jinja2__with_control_flow():
+    PROMPT_TEMPLATE = """
+    {% if is_wizard %}
+    {{ name }} is a wizard who lives in {{ city }}.
+    {% else %}
+    {{ name }} is a muggle who lives in {{ city }}.
+    {% endif %}
+    """
+
+    tested = PromptTemplate(PROMPT_TEMPLATE, type=PromptType.JINJA2)
+
+    wizard_result = tested.format(name="Harry", city="London", is_wizard=True)
+    assert "Harry is a wizard who lives in London." in wizard_result.strip()
+
+    muggle_result = tested.format(name="Dudley", city="Surrey", is_wizard=False)
+    assert "Dudley is a muggle who lives in Surrey." in muggle_result.strip()
+
+
+def test_prompt__format_jinja2__with_loops():
+    PROMPT_TEMPLATE = """
+    {{ name }}'s friends are:
+    {% for friend in friends %}
+    - {{ friend }}
+    {% endfor %}
+    """
+
+    tested = PromptTemplate(PROMPT_TEMPLATE, type=PromptType.JINJA2)
+
+    result = tested.format(name="Harry", friends=["Ron", "Hermione", "Neville"])
+
+    assert "Harry's friends are:" in result
+    assert "- Ron" in result
+    assert "- Hermione" in result
+    assert "- Neville" in result
+
+
+def test_prompt__format_jinja2__with_filters():
+    PROMPT_TEMPLATE = "{{ name | upper }} lives in {{ city | lower }}."
+
+    tested = PromptTemplate(PROMPT_TEMPLATE, type=PromptType.JINJA2)
+
+    result = tested.format(name="Harry", city="LONDON")
+    assert result == "HARRY lives in london."
+
+
+def test_prompt__format__none_values_render_as_empty_strings() -> None:
+    PROMPT_TEMPLATE = "Primary: {{primary}} Secondary: {{secondary}}"
+
+    tested = PromptTemplate(PROMPT_TEMPLATE)
+
+    result = tested.format(primary="cat", secondary=None)
+    assert result == "Primary: cat Secondary: "
+
+
+def test_prompt__format__value_containing_placeholder_syntax__inserted_as_is():
+    # Substitution used to run once per argument, so a value containing
+    # "{{answer}}" was itself rewritten when the "answer" key was applied.
+    tested = PromptTemplate("Q: {{question}} A: {{answer}}")
+
+    result = tested.format(question="what is {{answer}}?", answer="42")
+
+    assert result == "Q: what is {{answer}}? A: 42"
+
+
+def test_prompt__format__whitespace_inside_placeholder__substituted():
+    tested = PromptTemplate("Hi {{ name }}, welcome to {{city}}.")
+
+    result = tested.format(name="Harry", city="London")
+
+    assert result == "Hi Harry, welcome to London."
+
+
+def test_prompt__format__whitespace_in_argument_name__substituted():
+    tested = PromptTemplate("Hi {{ name }}, welcome to {{city}}.")
+
+    result = tested.format(**{" name ": "Harry", "city": "London"})
+
+    assert result == "Hi Harry, welcome to London."
+
+
+def test_prompt__format__placeholder_without_argument__left_unchanged():
+    tested = PromptTemplate(
+        "Hi {{name}}, welcome to {{ city }}.", validate_placeholders=False
+    )
+
+    result = tested.format(name="Harry")
+
+    assert result == "Hi Harry, welcome to {{ city }}."
+
+
+def test_prompt__format__brace_right_before_placeholder__substituted():
+    tested = PromptTemplate("x{{{n}}}y JSON: {{{n}}: 1}")
+
+    result = tested.format(n="H")
+
+    assert result == "x{H}y JSON: {H: 1}"
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{{ ''.__class__.__mro__ }}",
+        "{{ cycler.__init__.__globals__ }}",
+    ],
+)
+def test_prompt__format_jinja2__sandboxed_rendering_blocks_attribute_escape(template):
+    tested = PromptTemplate(template, type=PromptType.JINJA2)
+
+    with pytest.raises(SecurityError):
+        tested.format()
+
+
+def test_prompt__format_jinja2__normal_substitution_still_works_under_sandbox():
+    tested = PromptTemplate(
+        "{{ name | upper }} from {{ city }}", type=PromptType.JINJA2
+    )
+
+    result = tested.format(name="harry", city="London")
+
+    assert result == "HARRY from London"
+
+
+def test_prompt__format_jinja2__underscore_and_computed_data_access_render():
+    tested = PromptTemplate(
+        "{{ hit._id }}: {% for k in keys %}{{ row[k] }}{% endfor %}",
+        type=PromptType.JINJA2,
+    )
+
+    result = tested.format(
+        hit={"_id": "507f"}, keys=["a", "b"], row={"a": "1", "b": "2"}
+    )
+
+    assert result == "507f: 12"

@@ -1,0 +1,356 @@
+package com.comet.opik.domain;
+
+import com.comet.opik.api.Project;
+import com.comet.opik.api.Source;
+import com.comet.opik.api.SpanBatch;
+import com.comet.opik.api.Trace;
+import com.comet.opik.domain.mapping.OpenTelemetryMappingRuleFactory;
+import com.comet.opik.domain.mapping.otel.GeneralMappingRules;
+import com.comet.opik.infrastructure.OpenTelemetryConfig;
+import com.comet.opik.infrastructure.auth.RequestContext;
+import com.comet.opik.utils.WorkspaceUtils;
+import com.google.inject.ImplementedBy;
+import com.google.protobuf.ByteString;
+import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.metrics.LongCounter;
+import io.opentelemetry.api.metrics.Meter;
+import io.opentelemetry.proto.collector.trace.v1.ExportTraceServiceRequest;
+import io.opentelemetry.proto.trace.v1.Span;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.redisson.api.RedissonReactiveClient;
+import org.redisson.client.RedisException;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+import ru.vyarus.dropwizard.guice.module.yaml.bind.Config;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+@ImplementedBy(OpenTelemetryServiceImpl.class)
+public interface OpenTelemetryService {
+
+    Mono<Long> parseAndStoreSpans(@NonNull ExportTraceServiceRequest traceRequest,
+            @NonNull String fallbackProjectName);
+}
+
+@Singleton
+@RequiredArgsConstructor
+@Slf4j
+class OpenTelemetryServiceImpl implements OpenTelemetryService {
+
+    private static final int MAX_LOGGED_PROJECT_NAMES = 20;
+    private static final int MAX_LOGGED_SKIPPED_PROJECT_NAME_LENGTH = 400;
+    private static final String OTEL_METRICS_SCOPE = "opik.otel";
+    private static final Meter METER = GlobalOpenTelemetry.get().getMeter(OTEL_METRICS_SCOPE);
+    private static final AttributeKey<String> OPERATION_KEY = AttributeKey.stringKey("operation");
+    private static final LongCounter TRACE_ID_MAPPING_REDIS_ERRORS = METER
+            .counterBuilder(OTEL_METRICS_SCOPE + ".trace_id_mapping.redis_errors")
+            .setDescription("Redis errors while mapping OTel trace ids to Opik trace ids (tagged by operation)")
+            .build();
+
+    private final @NonNull TraceService traceService;
+    private final @NonNull SpanService spanService;
+    private final @NonNull ProjectService projectService;
+    private final @NonNull RedissonReactiveClient redisson;
+    private final @NonNull OpenTelemetryConfig config;
+
+    @Inject
+    public OpenTelemetryServiceImpl(@NonNull @Config("openTelemetry") OpenTelemetryConfig config,
+            @NonNull TraceService traceService,
+            @NonNull SpanService spanService,
+            @NonNull ProjectService projectService,
+            @NonNull RedissonReactiveClient redisson) {
+        this.config = config;
+        this.traceService = traceService;
+        this.spanService = spanService;
+        this.projectService = projectService;
+        this.redisson = redisson;
+    }
+
+    @Override
+    public Mono<Long> parseAndStoreSpans(@NonNull ExportTraceServiceRequest traceRequest,
+            @NonNull String fallbackProjectName) {
+
+        // OTLP allows an export with no spans. Return before any project is created.
+        var carriesSpans = traceRequest.getResourceSpansList().stream()
+                .flatMap(resourceSpans -> resourceSpans.getScopeSpansList().stream())
+                .anyMatch(scopeSpans -> scopeSpans.getSpansCount() > 0);
+        if (!carriesSpans) {
+            log.info("Received an OpenTelemetry batch with no spans; nothing to store");
+            return Mono.just(0L);
+        }
+
+        // find out whats the name of the integration library
+        var integrationName = traceRequest.getResourceSpansList().stream()
+                .flatMap(resourceSpans -> resourceSpans.getScopeSpansList().stream())
+                .map(scopeSpans -> scopeSpans.getScope().getName())
+                .distinct()
+                .filter(OpenTelemetryMappingRuleFactory::isValidInstrumentation)
+                .findFirst()
+                .orElse(null);
+
+        Map<String, List<Span>> spansByProjectName = new HashMap<>();
+        Set<String> skippedProjectNames = new LinkedHashSet<>();
+        long skippedSpans = 0;
+        for (var resourceSpans : traceRequest.getResourceSpansList()) {
+            var resourceProjectName = OpenTelemetryMapper
+                    .extractOpikProjectName(resourceSpans.getResource().getAttributesList());
+            for (var scopeSpans : resourceSpans.getScopeSpansList()) {
+                for (var span : scopeSpans.getSpansList()) {
+                    var spanProjectName = OpenTelemetryMapper.extractOpikProjectName(span.getAttributesList());
+                    var tooLong = Stream.of(spanProjectName, resourceProjectName)
+                            .flatMap(Optional::stream)
+                            .filter(name -> !OpenTelemetryMapper.isValidProjectName(name))
+                            .toList();
+                    if (!tooLong.isEmpty()) {
+                        skippedSpans++;
+                        skippedProjectNames.addAll(tooLong);
+                    }
+                    var projectName = spanProjectName.filter(OpenTelemetryMapper::isValidProjectName)
+                            .or(() -> resourceProjectName.filter(OpenTelemetryMapper::isValidProjectName))
+                            .orElse(fallbackProjectName);
+                    spansByProjectName.computeIfAbsent(WorkspaceUtils.getProjectName(projectName),
+                            name -> new ArrayList<>()).add(span);
+                }
+            }
+        }
+        var skippedSpanCount = skippedSpans;
+
+        return Mono.deferContextual(ctx -> {
+            String workspaceId = ctx.get(RequestContext.WORKSPACE_ID);
+
+            if (skippedSpanCount > 0) {
+                log.warn("Ignored '{}' on {} in workspaceId '{}' because the value is longer than {} characters: {}",
+                        GeneralMappingRules.OPIK_PROJECT_NAME_ATTR, spans(skippedSpanCount), workspaceId,
+                        OpenTelemetryMapper.MAX_PROJECT_NAME_LENGTH, describeSkippedProjectNames(skippedProjectNames));
+            }
+
+            return Flux.fromIterable(spansByProjectName.entrySet())
+                    .flatMap(entry -> projectService.getOrCreate(entry.getKey())
+                            .map(project -> Map.entry(project, entry.getValue())))
+                    .collect(Collectors.toMap(entry -> entry.getKey().id(), Function.identity(),
+                            OpenTelemetryServiceImpl::mergeSpans))
+                    .flatMapMany(spansByProjectId -> {
+                        log.info(
+                                "Storing OpenTelemetry spans in workspaceId '{}': {}. Spans without a valid '{}' go to project '{}'",
+                                workspaceId, describeProjects(spansByProjectId.values()),
+                                GeneralMappingRules.OPIK_PROJECT_NAME_ATTR, fallbackProjectName);
+                        return Flux.fromIterable(spansByProjectId.values());
+                    })
+                    .flatMap(entry -> storeProjectSpans(entry.getValue(), entry.getKey(), integrationName))
+                    .reduce(0L, Long::sum);
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private static Map.Entry<Project, List<Span>> mergeSpans(Map.Entry<Project, List<Span>> left,
+            Map.Entry<Project, List<Span>> right) {
+        return Map.entry(left.getKey(), Stream.concat(left.getValue().stream(), right.getValue().stream()).toList());
+    }
+
+    private static String describeSkippedProjectNames(Set<String> names) {
+        var described = names.stream()
+                .limit(MAX_LOGGED_PROJECT_NAMES)
+                .map(name -> "'" + StringUtils.abbreviate(name, MAX_LOGGED_SKIPPED_PROJECT_NAME_LENGTH) + "'")
+                .collect(Collectors.joining(", "));
+        var hidden = names.size() - MAX_LOGGED_PROJECT_NAMES;
+        return hidden > 0 ? described + " and " + hidden + " more" : described;
+    }
+
+    private static String describeProjects(Collection<Map.Entry<Project, List<Span>>> spansByProject) {
+        var described = spansByProject.stream()
+                .sorted(Map.Entry.comparingByValue(Comparator.comparingInt(List<Span>::size).reversed()))
+                .limit(MAX_LOGGED_PROJECT_NAMES)
+                .map(entry -> spans(entry.getValue().size()) + " to project '" + entry.getKey().name() + "'")
+                .collect(Collectors.joining(", "));
+        var hidden = spansByProject.size() - MAX_LOGGED_PROJECT_NAMES;
+        return hidden > 0
+                ? described + " and " + hidden + " more " + (hidden == 1 ? "project" : "projects")
+                : described;
+    }
+
+    private static String spans(long count) {
+        return count + (count == 1 ? " span" : " spans");
+    }
+
+    private Mono<Long> storeProjectSpans(List<Span> otelSpans, Project project, String integrationName) {
+        return Mono.deferContextual(ctx -> {
+            String workspaceId = ctx.get(RequestContext.WORKSPACE_ID);
+
+            // otelTraceId -> minimum timestamp seen with that traceId
+            var otelTracesAndMinTimestamp = otelSpans.stream()
+                    .collect(Collectors.toMap(Span::getTraceId, Span::getStartTimeUnixNano, Math::min));
+
+            // get or create a mapping of otel trace id -> opik trace id
+            return otelToOpikTraceIdMapper(otelTracesAndMinTimestamp, project.id(), workspaceId)
+                    .flatMap(traceMapper -> doStoreSpans(otelSpans, traceMapper, project.name(), integrationName));
+        });
+    }
+
+    private String base64OtelId(ByteString idBytes) {
+        return Base64.getEncoder().encodeToString(idBytes.toByteArray());
+    }
+
+    private String redisKey(String workspaceId, UUID projectId, String otelId) {
+        return "otelTraceId:" + workspaceId + ":" + projectId + ":" + otelId;
+    }
+
+    private Mono<Long> doStoreSpans(List<Span> otelSpans, Map<String, UUID> traceIdMapper, String projectName,
+            String integrationName) {
+
+        // Track trace IDs that came from opik.trace_id attribute overrides.
+        // These spans connect to existing OPIK traces, so we must not create new traces for them.
+        Set<UUID> overriddenTraceIds = new HashSet<>();
+
+        // converts otel spans into opik spans, using the mapped opik trace id
+        var opikSpans = otelSpans.stream()
+                .map(otelSpan -> {
+                    var otelTraceIdBase64 = base64OtelId(otelSpan.getTraceId());
+
+                    var opikTraceId = traceIdMapper.get(otelTraceIdBase64);
+
+                    OpenTelemetryMapper.extractOpikTraceId(otelSpan)
+                            .ifPresent(overriddenTraceIds::add);
+
+                    return OpenTelemetryMapper.toOpikSpan(otelSpan, opikTraceId, integrationName);
+                })
+                .map(opikSpan -> opikSpan.toBuilder()
+                        .projectName(projectName)
+                        .build())
+                .toList();
+
+        // Some integrations (e.g. PydanticAI/Logfire) put cumulative usage tokens on parent/agent spans
+        // that already represent the sum of all child LLM call spans. Including both the parent and children
+        // in sumMap() aggregation would double-count tokens. Clear usage from parent spans whose children
+        // also carry usage, so only the leaf LLM spans contribute to the aggregated token counts.
+        var parentIdsWithChildrenHavingUsage = opikSpans.stream()
+                .filter(span -> span.parentSpanId() != null
+                        && span.usage() != null
+                        && !span.usage().isEmpty())
+                .map(com.comet.opik.api.Span::parentSpanId)
+                .collect(Collectors.toSet());
+
+        var dedupedSpans = parentIdsWithChildrenHavingUsage.isEmpty()
+                ? opikSpans
+                : opikSpans.stream()
+                        .map(span -> parentIdsWithChildrenHavingUsage.contains(span.id())
+                                && span.usage() != null
+                                && !span.usage().isEmpty()
+                                        ? span.toBuilder().usage(null).build()
+                                        : span)
+                        .toList();
+
+        // Use spans without parentId as Trace roots. Skip opik.trace_id overrides (they attach to
+        // existing traces). Multiple roots can share one traceId (e.g. when parent_span_id==trace_id
+        // is nulled in the mapper), so dedup by traceId to create only one trace per id. First
+        // root in encounter order wins.
+        var seenTraceIds = new HashSet<UUID>();
+        var rootSpansByTraceId = dedupedSpans.stream()
+                .filter(span -> span.parentSpanId() == null)
+                .filter(span -> !overriddenTraceIds.contains(span.traceId()))
+                .filter(span -> seenTraceIds.add(span.traceId()))
+                .toList();
+        return Flux.fromStream(rootSpansByTraceId.stream())
+                .flatMap(rootSpan -> {
+                    // Extract thread_id from root span metadata if present
+                    String threadId = null;
+                    if (rootSpan.metadata() != null && rootSpan.metadata().has("thread_id")) {
+                        threadId = rootSpan.metadata().get("thread_id").asText();
+                    }
+
+                    var traceBuilder = Trace.builder()
+                            .id(rootSpan.traceId())
+                            .name(rootSpan.name())
+                            .projectName(rootSpan.projectName())
+                            .startTime(rootSpan.startTime())
+                            .endTime(rootSpan.endTime())
+                            .duration(rootSpan.duration())
+                            .input(rootSpan.input())
+                            .output(rootSpan.output())
+                            .metadata(rootSpan.metadata())
+                            .tags(rootSpan.tags())
+                            .errorInfo(rootSpan.errorInfo())
+                            .source(Source.SDK);
+
+                    if (StringUtils.isNotBlank(threadId)) {
+                        traceBuilder.threadId(threadId);
+                    }
+
+                    return traceService.create(traceBuilder.build());
+                })
+                .doOnNext(traceId -> log.info("TraceId '{}' created", traceId))
+                .then(Mono.defer(() -> {
+                    var spanBatch = SpanBatch.builder().spans(dedupedSpans).build();
+
+                    log.info("Parsed OpenTelemetry span batch for project '{}' into {} spans", projectName,
+                            dedupedSpans.size());
+
+                    return spanService.create(spanBatch);
+                }));
+    }
+
+    private Mono<Map<String, UUID>> otelToOpikTraceIdMapper(Map<ByteString, Long> otelTraceIds, UUID projectId,
+            String workspaceId) {
+        // checks Redis for the otel traceIds in the batch; have we seen them before?
+        // maps (base64 otel id -> UUIDv7 opik id)
+        return Flux.fromIterable(otelTraceIds.entrySet()).flatMap(otelPack -> {
+            var otelTraceId = otelPack.getKey();
+            var otelTimestamp = Duration.ofNanos(otelPack.getValue()).toMillis();
+
+            var otelTraceIdBase64 = base64OtelId(otelTraceId);
+
+            var otelTraceIdRedisKey = redisKey(workspaceId, projectId, otelTraceIdBase64);
+            var ttl = config.getTtl().toJavaDuration();
+
+            // for an unknown otel trace id, create an opik trace id with this span timestamp as we sorted otel
+            // spans by time on previous step, it will be the closest time possible for the actual trace start
+            var freshOpikTraceId = Mono.fromSupplier(() -> OpenTelemetryMapper
+                    .convertOtelIdToUUIDv7(otelTraceId.toByteArray(), otelTimestamp).toString());
+
+            // A Redis error must not fail the batch: exporters retry a few times and then drop the spans. Fall back
+            // to a fresh id, at the cost of possibly splitting a trace spread across batches. A failed lookup skips
+            // the store, so a mapping that may still exist is never overwritten.
+            var cachedOpikTraceId = redisson.getBucket(otelTraceIdRedisKey).getAndExpire(ttl)
+                    .onErrorResume(RedisException.class,
+                            error -> onRedisError("lookup", otelTraceIdRedisKey, error).then(freshOpikTraceId));
+
+            return cachedOpikTraceId.switchIfEmpty(Mono.defer(() -> freshOpikTraceId.flatMap(opikTraceId -> {
+                log.info("Creating mapping in Redis for otel trace id '{}' -> opik trace id '{}'", otelTraceIdRedisKey,
+                        opikTraceId);
+                return redisson.getBucket(otelTraceIdRedisKey)
+                        .set(opikTraceId, ttl)
+                        .onErrorResume(RedisException.class,
+                                error -> onRedisError("store", otelTraceIdRedisKey, error))
+                        .thenReturn(opikTraceId);
+            }))).map(opikTraceId -> Map.entry(otelTraceIdBase64, opikTraceId));
+        }).collectMap(Map.Entry::getKey, entry -> UUID.fromString((String) entry.getValue()));
+    }
+
+    private Mono<Void> onRedisError(String operation, String otelTraceIdRedisKey, RedisException error) {
+        log.warn("Redis operation failed, continuing without the mapping, operation '{}', otelTraceIdRedisKey '{}'",
+                operation, otelTraceIdRedisKey, error);
+        TRACE_ID_MAPPING_REDIS_ERRORS.add(1, Attributes.of(OPERATION_KEY, operation));
+        return Mono.empty();
+    }
+}

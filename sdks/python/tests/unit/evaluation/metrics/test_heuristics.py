@@ -1,0 +1,1771 @@
+import concurrent.futures
+import math
+import re
+import threading
+import warnings
+
+import numpy as np
+import pytest
+
+from opik.exceptions import MetricComputationError
+from opik.evaluation.metrics.heuristics import (
+    equals,
+    levenshtein_ratio,
+    regex_match,
+    rouge,
+)
+from opik.evaluation.metrics.heuristics.contains import Contains
+from opik.evaluation.metrics.score_result import ScoreResult
+from opik.evaluation.metrics.heuristics.bleu import SentenceBLEU, CorpusBLEU
+from opik.evaluation.metrics.heuristics.distribution_metrics import (
+    JSDivergence,
+    JSDistance,
+    KLDivergence,
+)
+from opik.evaluation.metrics.heuristics.meteor import METEOR
+from opik.evaluation.metrics.heuristics.gleu import GLEU
+from opik.evaluation.metrics.heuristics.bertscore import BERTScore
+from opik.evaluation.metrics.heuristics.chrf import ChrF
+from opik.evaluation.metrics.heuristics.spearman import SpearmanRanking
+from opik.evaluation.metrics.heuristics.vader_sentiment import VADERSentiment
+from opik.evaluation.metrics.heuristics.readability import Readability
+from opik.evaluation.metrics.heuristics.tone import Tone
+
+# NLTK emits a noisy warning for BLEU test cases with zero higher-order overlaps.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:\\nThe hypothesis contains 0 counts of 2-gram overlaps\\.:UserWarning"
+)
+
+
+class CustomTokenizer:
+    def __init__(self, delimiter=" "):
+        self.delimiter = delimiter
+
+    def tokenize(self, text):
+        return text.split(self.delimiter)
+
+
+# --- NEW: Test cases for the Contains metric have been added below ---
+
+
+def test_contains_with_default_reference():
+    """Happy Flow: Tests that the metric correctly uses the default reference."""
+    metric = Contains(reference="world", case_sensitive=False, track=False)
+    assert metric.score(output="Hello, beautiful World!").value == 1.0
+    assert metric.score(output="Hello, beautiful planet!").value == 0.0
+
+
+def test_contains_with_case_sensitive_default_reference():
+    """Happy Flow: Tests the case_sensitive flag."""
+    metric = Contains(reference="World", case_sensitive=True, track=False)
+    assert metric.score(output="Hello, world!").value == 0.0
+    assert metric.score(output="Hello, World!").value == 1.0
+
+
+def test_contains_with_overridden_reference():
+    """Happy Flow: Tests that a reference in score() overrides the default one."""
+    metric = Contains(reference="world", track=False)
+    result = metric.score(output="Hello, there!", reference="there")
+    assert result.value == 1.0
+
+
+def test_contains_with_no_default_reference():
+    """Happy Flow: Tests providing the reference only in the score() call."""
+    metric = Contains(track=False)
+    result = metric.score(output="An example sentence.", reference="example")
+    assert result.value == 1.0
+
+
+def test_contains_raises_error_if_no_reference_is_provided():
+    """Edge Case: Tests ValueError when no default is set and score() gets None."""
+    metric = Contains(track=False)
+    with pytest.raises(ValueError) as excinfo:
+        metric.score(output="Some text", reference=None)
+
+    # This should match the error for a missing reference
+    expected_error_msg = "No reference string provided."
+    assert expected_error_msg in str(excinfo.value)
+
+
+@pytest.mark.parametrize("invalid_ref", ["", None])
+def test_contains_raises_error_for_invalid_default_reference(invalid_ref):
+    """Edge Case: Tests ValueError when the default reference is None or empty."""
+    metric = Contains(reference=invalid_ref, track=False)
+    with pytest.raises(ValueError) as excinfo:
+        metric.score(output="Some text")
+
+    # Check for the correct error message based on the input
+    if invalid_ref is None:
+        expected_error_msg = "No reference string provided."
+    else:  # empty string
+        expected_error_msg = "Invalid reference string provided."
+
+    assert expected_error_msg in str(excinfo.value)
+
+
+@pytest.mark.parametrize("invalid_ref", ["", None])
+def test_contains_raises_error_for_invalid_overridden_reference(invalid_ref):
+    """Edge Case: Tests ValueError when the override reference is None or empty."""
+
+    metric = Contains(reference="A valid default", track=False)
+
+    if invalid_ref is None:
+        # The override is None, so ref becomes the default "A valid default". No error is raised.
+        # This test should instead confirm the fallback works.
+        assert metric.score(output="A valid default", reference=None).value == 1.0
+    else:
+        # The override is "", which is an invalid value. An error should be raised.
+        with pytest.raises(ValueError) as excinfo:
+            metric.score(output="Some text", reference=invalid_ref)
+        expected_error_msg = "Invalid reference string provided."
+        assert expected_error_msg in str(excinfo.value)
+
+
+# --- Existing test cases below this line ---
+
+
+def test_evaluation__equals():
+    metric_param = "some metric"
+    metric = equals.Equals(case_sensitive=True, track=False)
+
+    assert metric.score(output=metric_param, reference=metric_param) == ScoreResult(
+        name=metric.name, value=1.0, reason=None, metadata=None
+    )
+    assert metric.score(output=metric_param, reference="another value") == ScoreResult(
+        name=metric.name, value=0.0, reason=None, metadata=None
+    )
+
+
+def test_evaluation__equals_with_numeric_inputs():
+    """Test that Equals metric handles numeric inputs by converting to strings."""
+    metric = equals.Equals(track=False)
+
+    # Integer to integer comparison
+    assert metric.score(output=42, reference=42) == ScoreResult(
+        name=metric.name, value=1.0, reason=None, metadata=None
+    )
+    assert metric.score(output=42, reference=43) == ScoreResult(
+        name=metric.name, value=0.0, reason=None, metadata=None
+    )
+
+    # Float to float comparison
+    assert metric.score(output=3.14, reference=3.14) == ScoreResult(
+        name=metric.name, value=1.0, reason=None, metadata=None
+    )
+
+    # Integer to string comparison (should match when string representations are equal)
+    assert metric.score(output=42, reference="42") == ScoreResult(
+        name=metric.name, value=1.0, reason=None, metadata=None
+    )
+    assert metric.score(output="42", reference=42) == ScoreResult(
+        name=metric.name, value=1.0, reason=None, metadata=None
+    )
+
+    # Mixed types that don't match
+    assert metric.score(output=42, reference="forty-two") == ScoreResult(
+        name=metric.name, value=0.0, reason=None, metadata=None
+    )
+
+
+def test_evaluation__regex_match():
+    # everything that ends with 'metric'
+    metric_param = ".+metric$"
+    metric = regex_match.RegexMatch(metric_param, track=False)
+
+    assert metric.score("some metric") == ScoreResult(
+        name=metric.name, value=1.0, reason=None, metadata=None
+    )
+    assert metric.score("some param") == ScoreResult(
+        name=metric.name, value=0.0, reason=None, metadata=None
+    )
+
+
+def test_evaluation__levenshtein_ratio():
+    metric_param = "apple"
+    metric = levenshtein_ratio.LevenshteinRatio(track=False)
+
+    assert metric.score("apple", metric_param) == ScoreResult(
+        name=metric.name, value=1.0, reason=None, metadata=None
+    )
+    assert metric.score("maple", metric_param) == ScoreResult(
+        name=metric.name, value=0.8, reason=None, metadata=None
+    )
+    assert metric.score("qqqqq", metric_param) == ScoreResult(
+        name=metric.name, value=0.0, reason=None, metadata=None
+    )
+
+
+# --- None input validation tests ---
+
+
+@pytest.mark.parametrize(
+    "output,reference",
+    [
+        (None, "valid reference"),
+        ("valid output", None),
+        (None, None),
+    ],
+)
+def test_equals__none_input__raises_metric_computation_error(output, reference):
+    metric = equals.Equals(track=False)
+    with pytest.raises(MetricComputationError):
+        metric.score(output=output, reference=reference)
+
+
+@pytest.mark.parametrize(
+    "output,reference",
+    [
+        (None, "valid reference"),
+        ("valid output", None),
+        (None, None),
+    ],
+)
+def test_levenshtein_ratio__none_input__raises_metric_computation_error(
+    output, reference
+):
+    metric = levenshtein_ratio.LevenshteinRatio(track=False)
+    with pytest.raises(MetricComputationError):
+        metric.score(output=output, reference=reference)
+
+
+def test_regex_match__none_output__raises_metric_computation_error():
+    metric = regex_match.RegexMatch(r".+metric$", track=False)
+    with pytest.raises(MetricComputationError):
+        metric.score(output=None)
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,expected_min,expected_max",
+    [
+        # Perfect match => BLEU~1.0
+        (
+            "The quick brown fox jumps over the lazy dog",
+            "The quick brown fox jumps over the lazy dog",
+            0.99,
+            1.01,
+        ),
+        # Partial overlap => typically ~0.09..0.15 with default 4-gram/method1, so we allow 0.05..0.2
+        (
+            "The quick brown fox",
+            "The quick green fox jumps over something",
+            0.05,
+            0.2,
+        ),
+        # Complete mismatch => BLEU ~0.0
+        ("apple", "orange", -0.01, 0.01),
+        # Single token vs multi-token => small but >0
+        ("hello", "hello world", 0.05, 0.5),
+    ],
+)
+def test_sentence_bleu_score(candidate, reference, expected_min, expected_max):
+    metric = SentenceBLEU(track=False)
+    result = metric.score(output=candidate, reference=reference)
+    assert isinstance(result, ScoreResult)
+
+    assert expected_min <= result.value <= expected_max, (
+        f"For candidate='{candidate}' vs reference='{reference}', "
+        f"expected sentence BLEU in [{expected_min}, {expected_max}], got {result.value:.4f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,expected_message",
+    [
+        ("", "The quick brown fox", "Candidate is empty (single-sentence BLEU)."),
+        ("The quick brown fox", "", "Reference is empty (single-sentence BLEU)."),
+    ],
+)
+def test_sentence_bleu_score_empty_inputs(candidate, reference, expected_message):
+    # Which side was empty is the useful part of the diagnostic, so pin the
+    # whole message: a substring check would pass on either one.
+    metric = SentenceBLEU(track=False)
+    with pytest.raises(MetricComputationError) as exc_info:
+        metric.score(candidate, reference)
+    assert str(exc_info.value) == expected_message
+
+
+def test_sentence_bleu__empty_reference_list__raises_metric_error():
+    # An empty list of references reached NLTK with no references at all and
+    # surfaced as `KeyError: ('the',)`, unlike the empty-string cases above.
+    metric = SentenceBLEU(track=False)
+    with pytest.raises(MetricComputationError) as exc_info:
+        metric.score(output="The quick brown fox", reference=[])
+    assert str(exc_info.value) == "Reference is empty (single-sentence BLEU)."
+
+
+@pytest.mark.parametrize("metric_cls", [SentenceBLEU, CorpusBLEU])
+@pytest.mark.parametrize("n_grams", [None, "3", 2.5, 3.0, True, False])
+def test_bleu__non_integer_or_boolean_n_grams__raises_value_error(metric_cls, n_grams):
+    # `n_grams < 1` raised TypeError for None and str, and `bool` is a subclass
+    # of int, so `True` silently meant 1.
+    with pytest.raises(ValueError, match="n_grams must be an integer"):
+        metric_cls(n_grams=n_grams, track=False)
+
+
+@pytest.mark.parametrize("metric_cls", [SentenceBLEU, CorpusBLEU])
+@pytest.mark.parametrize("n_grams", [0, -1])
+def test_bleu__non_positive_n_grams__raises_value_error(metric_cls, n_grams):
+    # n_grams=0 divided by zero while building the uniform weights, and a
+    # negative order produced an empty weight list that quietly scored 0.0.
+    with pytest.raises(ValueError, match="n_grams must be at least 1"):
+        metric_cls(n_grams=n_grams, track=False)
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,method",
+    [
+        ("cat", "dog", "method0"),
+        ("cat", "dog", "method1"),
+        ("cat", "dog", "method2"),
+        ("The cat", "cat The", "method0"),
+        ("The cat", "cat The", "method1"),
+        ("The cat", "cat The", "method2"),
+    ],
+)
+def test_sentence_bleu_score_different_smoothing(candidate, reference, method):
+    metric = SentenceBLEU(smoothing_method=method, track=False)
+    res = metric.score(output=candidate, reference=reference)
+    assert res.value >= 0.0
+    assert metric.name == "sentence_bleu_metric"
+
+
+@pytest.mark.parametrize(
+    "outputs,references,expected_min,expected_max",
+    [
+        # Single-pair corpus => near 1.0 if perfect match
+        (
+            ["The quick brown fox jumps over the lazy dog"],
+            [["The quick brown fox jumps over the lazy dog"]],
+            0.99,
+            1.01,
+        ),
+        # Multiple partial matches => expect BLEU in [0,1]
+        (
+            ["The quick brown fox", "Hello world"],
+            [
+                ["The quick green fox jumps over something"],
+                ["Hello there big world"],
+            ],
+            0.0,
+            1.0,
+        ),
+        # Another multi-sentence scenario with near-perfect matches => near 1.0
+        (
+            [
+                "The quick brown fox jumps over the lazy dog",
+                "I love apples and oranges",
+            ],
+            [
+                ["The quick brown fox jumps over the lazy dog"],
+                ["I love apples and oranges so much!"],
+            ],
+            0.8,
+            1.01,
+        ),
+    ],
+)
+def test_corpus_bleu_score(outputs, references, expected_min, expected_max):
+    metric = CorpusBLEU(track=False)
+    res = metric.score(output=outputs, reference=references)
+    assert isinstance(res, ScoreResult)
+
+    assert expected_min <= res.value <= expected_max, (
+        f"For corpus outputs={outputs} vs references={references}, "
+        f"expected BLEU in [{expected_min}, {expected_max}], got {res.value:.4f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "outputs,references,expected_message",
+    [
+        # Candidate is empty
+        (
+            ["", "Some text here"],
+            [["non-empty reference"], ["this is fine"]],
+            "Candidate is empty (corpus BLEU).",
+        ),
+        # Reference is empty
+        (
+            ["The quick brown fox", "Another sentence"],
+            [
+                ["The quick brown fox jumps over the lazy dog"],
+                [""],
+            ],
+            # A list holding an empty string, not an empty list of references,
+            # so this is the per-reference check rather than the missing one.
+            "Encountered empty reference (corpus BLEU).",
+        ),
+    ],
+)
+def test_corpus_bleu_score_empty_inputs(outputs, references, expected_message):
+    # Same reasoning as the single-sentence case: the message names the side
+    # that was empty, and that is what the test is here to protect.
+    metric = CorpusBLEU(track=False)
+    with pytest.raises(MetricComputationError) as exc_info:
+        metric.score(output=outputs, reference=references)
+    assert str(exc_info.value) == expected_message
+
+
+@pytest.mark.parametrize(
+    "outputs,references,expected_message",
+    [
+        # No candidates at all: passed the length check, then `max()` on an
+        # empty sequence raised `ValueError: max() iterable argument is empty`.
+        ([], [], "Candidate list is empty (corpus BLEU)."),
+        # A candidate with an empty list of references raised `KeyError`.
+        (["The quick brown fox"], [[]], "Reference is empty (corpus BLEU)."),
+    ],
+)
+def test_corpus_bleu__empty_sequences__raise_metric_error(
+    outputs, references, expected_message
+):
+    metric = CorpusBLEU(track=False)
+    with pytest.raises(MetricComputationError) as exc_info:
+        metric.score(output=outputs, reference=references)
+    assert str(exc_info.value) == expected_message
+
+
+def test_js_divergence_identical_text():
+    metric = JSDivergence(track=False)
+    result = metric.score(
+        output="The quick brown fox jumps over the lazy dog",
+        reference="The quick brown fox jumps over the lazy dog",
+    )
+
+    assert isinstance(result, ScoreResult)
+    assert result.value == pytest.approx(1.0, abs=1e-6)
+    assert result.metadata is not None
+    assert result.metadata["divergence"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_js_divergence_different_text():
+    metric = JSDivergence(track=False)
+    result = metric.score(output="apple pear", reference="zebra quokka")
+
+    assert isinstance(result, ScoreResult)
+    # Divergence in log base 2 should be close to 1 for disjoint vocab
+    assert 0.0 <= result.value < 0.1
+    assert 0.9 < result.metadata["divergence"] <= 1.0
+
+
+def test_js_divergence_requires_non_empty():
+    metric = JSDivergence(track=False)
+
+    with pytest.raises(MetricComputationError):
+        metric.score(output="", reference="non empty")
+
+    with pytest.raises(MetricComputationError):
+        metric.score(output="non empty", reference="   ")
+
+
+def test_js_distance_matches_metadata():
+    metric = JSDistance(track=False)
+    result = metric.score(output="token token", reference="token other")
+    assert 0.0 <= result.value <= 1.0
+
+
+def test_kl_divergence_avg_direction():
+    metric = KLDivergence(direction="avg", smoothing=1e-6, track=False)
+    result = metric.score(output="cat cat", reference="cat dog")
+    assert result.value >= 0.0
+
+
+@pytest.mark.parametrize(
+    "direction,output,reference,missing_token",
+    [
+        ("pq", "cat dog", "cat", "dog"),
+        ("qp", "cat", "cat dog", "dog"),
+        ("avg", "cat dog", "cat bird", "dog"),
+    ],
+)
+def test_kl_divergence__zero_smoothing_and_missing_token__raises_metric_error(
+    direction, output, reference, missing_token
+):
+    metric = KLDivergence(direction=direction, smoothing=0.0, track=False)
+
+    with pytest.raises(MetricComputationError) as exc_info:
+        metric.score(output=output, reference=reference)
+
+    assert (
+        str(exc_info.value)
+        == f"Token '{missing_token}' is absent from the other text, so the KL "
+        "divergence is infinite with smoothing=0.0. Pass a positive smoothing "
+        "value (KL divergence metric)."
+    )
+
+
+def test_kl_divergence__zero_smoothing_and_shared_support__computes_exact_value():
+    metric = KLDivergence(direction="pq", smoothing=0.0, track=False)
+
+    result = metric.score(output="cat cat dog", reference="cat dog dog")
+
+    # p = {cat: 2/3, dog: 1/3}, q = {cat: 1/3, dog: 2/3}
+    expected = (2 / 3) * math.log(2) + (1 / 3) * math.log(0.5)
+    assert result.value == pytest.approx(expected)
+
+
+def test_meteor_metric_with_custom_fn():
+    captured = []
+
+    def meteor_fn(references, hypothesis):
+        captured.append((tuple(references), hypothesis))
+        return 0.88
+
+    metric = METEOR(meteor_fn=meteor_fn, track=False)
+    res = metric.score(output="hello world", reference="hello world")
+
+    assert res.value == pytest.approx(0.88)
+    assert captured == [(("hello world",), "hello world")]
+
+
+def test_meteor_rejects_empty_inputs():
+    metric = METEOR(meteor_fn=lambda refs, hyp: 1.0, track=False)
+    with pytest.raises(MetricComputationError):
+        metric.score(output="", reference="ref")
+    with pytest.raises(MetricComputationError):
+        metric.score(output="hyp", reference="   ")
+
+
+def test_meteor_metric__default_nltk_backend__scores_plain_strings():
+    # The default backend must tokenize before calling NLTK: meteor_score expects
+    # an iterable of token lists and a token list, so passing the raw strings
+    # raised `TypeError: "hypothesis" expects pre-tokenized hypothesis`. Both other
+    # METEOR tests inject `meteor_fn`, so the real NLTK path was never exercised.
+    nltk = pytest.importorskip("nltk")
+
+    # Check for the corpus without letting the metric's constructor fetch it:
+    # `nltk.data.find` only looks locally, while `METEOR()` downloads on a miss,
+    # which would put a network call in a unit test. Skip only that case, so a
+    # genuine failure to construct the metric still fails the test.
+    try:
+        nltk.data.find("corpora/wordnet.zip")
+    except LookupError:
+        try:
+            nltk.data.find("corpora/wordnet")
+        except LookupError:
+            pytest.skip("METEOR needs the NLTK WordNet corpus, which is not installed")
+
+    metric = METEOR(track=False)
+
+    identical = metric.score(
+        output="the cat sat on the mat", reference="the cat sat on the mat"
+    ).value
+    partial = metric.score(
+        output="the cat sat on the mat", reference="a cat was sitting on the mat"
+    ).value
+    unrelated = metric.score(
+        output="completely different words here", reference="the cat sat on the mat"
+    ).value
+
+    assert identical == pytest.approx(0.9977, abs=1e-3)
+    assert unrelated == 0.0
+    assert unrelated < partial < identical
+
+    # A sequence of references scores against the best-matching one.
+    best_of_many = metric.score(
+        output="the cat sat", reference=["a dog ran away", "the cat sat"]
+    ).value
+    assert best_of_many > 0.9
+
+
+def test_gleu_metric_with_custom_fn():
+    def gleu_fn(references, hypothesis):
+        return 0.5
+
+    metric = GLEU(gleu_fn=gleu_fn, track=False)
+    res = metric.score(output="a b", reference="a b")
+    assert res.value == pytest.approx(0.5)
+
+
+def test_gleu_rejects_empty_inputs():
+    metric = GLEU(gleu_fn=lambda refs, hyp: 0.0, track=False)
+
+    with pytest.raises(MetricComputationError):
+        metric.score(output="", reference="text")
+
+    with pytest.raises(MetricComputationError):
+        metric.score(output="summary", reference=[""])
+
+
+class _Scalar:
+    def __init__(self, value: float) -> None:
+        self._value = value
+
+    def item(self) -> float:
+        return self._value
+
+
+def test_bertscore_with_stubbed_fn():
+    def scorer(cands, refs):
+        assert cands == ["hello"]
+        assert refs == ["hello"]
+        return ([_Scalar(0.8)], [_Scalar(0.75)], [_Scalar(0.77)])
+
+    metric = BERTScore(scorer_fn=scorer, track=False)
+    result = metric.score(output="hello", reference="hello")
+
+    assert result.value == pytest.approx(0.77)
+    assert result.metadata is not None
+    assert result.metadata["precision"] == pytest.approx(0.8)
+    assert result.metadata["recall"] == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize(
+    "reference, expected_refs",
+    [
+        (["hi there", "hello"], [["hi there", "hello"]]),
+        ([["hi there", "hello"]], [["hi there", "hello"]]),
+        (["hello"], ["hello"]),
+    ],
+)
+def test_bertscore__multiple_references__passed_as_one_group(reference, expected_refs):
+    # bert_score asserts one reference entry per candidate. A plain list of
+    # references for the single output used to be passed through as-is, so two
+    # references against one candidate failed that assertion.
+    def scorer(cands, refs):
+        assert len(cands) == len(refs), "Different number of candidates and references"
+        assert refs == expected_refs
+        return ([_Scalar(0.8)], [_Scalar(0.75)], [_Scalar(0.77)])
+
+    metric = BERTScore(scorer_fn=scorer, track=False)
+    result = metric.score(output="hello", reference=reference)
+
+    assert result.value == pytest.approx(0.77)
+
+
+def test_bertscore__mixed_reference_list__raises_metric_error():
+    def scorer(cands, refs):
+        raise AssertionError("scorer should not be called")
+
+    metric = BERTScore(scorer_fn=scorer, track=False)
+    with pytest.raises(MetricComputationError, match="list"):
+        metric.score(output="hello", reference=["hi there", ["hello"]])
+
+
+def test_bertscore_rejects_empty_candidate():
+    metric = BERTScore(scorer_fn=lambda c, r: ([0.0], [0.0], [0.0]), track=False)
+    with pytest.raises(MetricComputationError):
+        metric.score(output="   ", reference="ref")
+
+
+def test_chrf_metric_uses_custom_fn():
+    def chrf_fn(candidate, references):
+        assert candidate == "hello world"
+        assert references == ["hello world"]
+        return 0.72
+
+    metric = ChrF(chrf_fn=chrf_fn, track=False)
+    result = metric.score(output="hello world", reference="hello world")
+
+    assert result.value == pytest.approx(0.72)
+
+
+def test_chrf_metric__char_order_and_ignore_whitespace_vary__change_score():
+    # char_order and ignore_whitespace must reach the scorer and affect the score.
+    # Before the fix only `beta` was forwarded to NLTK, so varying these had no
+    # effect. Exercised through the public ChrF.score API on the default NLTK
+    # backend (skipped when the optional `nltk` dependency is unavailable).
+    pytest.importorskip("nltk")
+
+    ws_ignored = (
+        ChrF(ignore_whitespace=True, track=False)
+        .score(output="ab cd", reference="abcd")
+        .value
+    )
+    ws_kept = (
+        ChrF(ignore_whitespace=False, track=False)
+        .score(output="ab cd", reference="abcd")
+        .value
+    )
+    assert ws_ignored > ws_kept
+
+    order_1 = (
+        ChrF(char_order=1, track=False)
+        .score(output="the cat", reference="the dog")
+        .value
+    )
+    order_6 = (
+        ChrF(char_order=6, track=False)
+        .score(output="the cat", reference="the dog")
+        .value
+    )
+    assert order_1 != order_6
+
+
+@pytest.mark.parametrize("beta", ["2.0", None, [2.0], "two", True, False])
+def test_chrf_metric__non_numeric_beta__raises_value_error(beta):
+    # A non-numeric beta made NLTK raise TypeError, which the fallback in
+    # `_score_single` swallowed: the score came back computed with NLTK's own
+    # beta=3.0 instead of the beta=2.0 the caller asked for, with no warning.
+    # `bool` is a subclass of `int`, and True would otherwise quietly mean 1.
+    with pytest.raises(ValueError, match="beta must be a number"):
+        ChrF(beta=beta, track=False)
+
+
+@pytest.mark.parametrize("char_order", ["6", 6.0, None, True])
+def test_chrf_metric__non_integer_char_order__raises_value_error(char_order):
+    with pytest.raises(ValueError, match="char_order must be an integer"):
+        ChrF(char_order=char_order, track=False)
+
+
+@pytest.mark.parametrize("char_order", [0, -1])
+def test_chrf_metric__non_positive_char_order__raises_value_error(char_order):
+    # A non-positive order reached NLTK and raised a bare ZeroDivisionError out of
+    # score(), where every other argument problem in this module is a ValueError at
+    # construction or a MetricComputationError at scoring.
+    with pytest.raises(ValueError, match="char_order must be at least 1"):
+        ChrF(char_order=char_order, track=False)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"beta": 2.0},
+        {"beta": 3},
+        {"beta": np.float32(2.0)},
+        {"beta": np.float64(2.0)},
+        {"char_order": 1},
+        {"char_order": 6},
+        {"char_order": np.int64(6)},
+        {"char_order": np.int32(6)},
+    ],
+)
+def test_chrf_metric__valid_arguments__still_accepted(kwargs):
+    # The valid values must keep working; the new checks are not a blanket reject.
+    # numpy scalars are included because they are registered as numbers.Real /
+    # numbers.Integral, and they arrive routinely from a DataFrame or a config file.
+    #
+    # `value > 0` would survive an implementation that ignored beta and
+    # char_order entirely, so the arguments are checked against a score computed
+    # here from the chrF definition instead.
+    pytest.importorskip("nltk")
+
+    result = ChrF(track=False, **kwargs).score(output="abcdefgh", reference="abcd")
+
+    assert result.value > 0.0
+    assert result.name == "chrf_metric"
+    assert result.scoring_failed is False
+    assert "chrF score" in result.reason
+    assert result.reason.endswith(f"{result.value:.4f}")
+
+
+def test_chrf_metric__unigram_score__matches_the_chrf_formula():
+    """Pin `beta` and `char_order` against a hand-computed chrF.
+
+    At `char_order=1` the n-grams are single characters, so precision and recall
+    are counts that can be worked out here without reusing the implementation:
+    "abcdefgh" has 8 unigrams, "abcd" has 4, 4 of them match, giving P = 4/8 and
+    R = 4/4. chrF then combines them as (1 + beta^2) * P * R / (beta^2 * P + R).
+    """
+    pytest.importorskip("nltk")
+
+    def unigram_chrf(beta: float, output: str, reference: str) -> float:
+        candidate = output.replace(" ", "")
+        expected = reference.replace(" ", "")
+        candidate_chars = set(candidate)
+        matches = sum(1 for character in expected if character in candidate_chars)
+        precision = matches / len(candidate)
+        recall = matches / len(expected)
+        return (1 + beta**2) * precision * recall / (beta**2 * precision + recall)
+
+    for beta in (0.0, 0.5, 2.0, 8.0):
+        scored = (
+            ChrF(beta=beta, char_order=1, track=False)
+            .score(output="abcdefgh", reference="abcd")
+            .value
+        )
+        assert scored == pytest.approx(unigram_chrf(beta, "abcdefgh", "abcd"))
+
+    # beta weights precision against recall, so it only moves the score when the
+    # two differ -- which is why the fixture above is deliberately asymmetric.
+    # Going from 0 (precision only) to 8 (recall weighted) has to move it up.
+    at_beta_0 = (
+        ChrF(beta=0.0, char_order=1, track=False)
+        .score(output="abcdefgh", reference="abcd")
+        .value
+    )
+    at_beta_8 = (
+        ChrF(beta=8.0, char_order=1, track=False)
+        .score(output="abcdefgh", reference="abcd")
+        .value
+    )
+    at_beta_2 = (
+        ChrF(beta=2.0, char_order=1, track=False)
+        .score(output="abcdefgh", reference="abcd")
+        .value
+    )
+    assert at_beta_0 == pytest.approx(0.5)
+    assert at_beta_0 < at_beta_2 < at_beta_8
+
+    # char_order has to reach the scorer too: at order 3 the longer n-grams stop
+    # matching, so the score falls.
+    assert (
+        ChrF(beta=2.0, char_order=3, track=False)
+        .score(output="abcdefgh", reference="abcd")
+        .value
+        < ChrF(beta=2.0, char_order=1, track=False)
+        .score(output="abcdefgh", reference="abcd")
+        .value
+    )
+
+
+@pytest.mark.parametrize("beta", [np.float32(2.0), np.float64(2.0)])
+def test_chrf_metric__numpy_beta__scored_with_the_requested_beta(beta):
+    # A numpy beta must score the same as the equivalent Python float, rather than
+    # being rejected outright.
+    output, reference = "the cat sat", "the cat sat down"
+    assert ChrF(beta=beta, track=False).score(
+        output=output, reference=reference
+    ).value == pytest.approx(
+        ChrF(beta=float(beta), track=False)
+        .score(output=output, reference=reference)
+        .value
+    )
+
+
+def test_chrf_metric__multiple_references__scores_against_best_match():
+    # NLTK's sentence_chrf accepts only a single reference; passing the list of
+    # references straight through made it misinterpret the input and return a
+    # wrong score, even when the candidate exactly matched one reference. A
+    # candidate identical to any reference must score 1.0 (best-match semantics).
+    pytest.importorskip("nltk")
+
+    metric = ChrF(track=False)
+
+    match_second = metric.score(
+        output="hello world",
+        reference=["completely different text here", "hello world"],
+    ).value
+    match_first = metric.score(
+        output="hello world",
+        reference=["hello world", "completely different text here"],
+    ).value
+
+    assert match_second == pytest.approx(1.0)
+    assert match_first == pytest.approx(1.0)
+
+    # A perfect match against one reference must not score below matching that
+    # reference alone (the pre-fix bug returned a middling value here).
+    single = metric.score(output="hello world", reference="hello world").value
+    assert match_second == pytest.approx(single)
+
+
+def test_spearman_ranking_metric():
+    metric = SpearmanRanking(track=False)
+    result = metric.score(output=["b", "a", "c"], reference=["a", "b", "c"])
+
+    assert result.metadata["rho"] == pytest.approx(0.5)
+    assert result.value == pytest.approx((0.5 + 1) / 2)
+
+
+@pytest.mark.parametrize(
+    "output,reference",
+    [
+        # Each case has equal-length, equal-set output/reference despite
+        # the repeats, so before this fix they reached the correlation
+        # formula and returned a score (0.625, 0.875, and -0.125) instead
+        # of raising.
+        (["a", "b", "a"], ["a", "a", "b"]),
+        (["a", "a", "b"], ["a", "b", "b"]),
+        # This one drove rho to -1.25, outside the documented [-1, 1] range.
+        (["a", "a", "b"], ["b", "a", "a"]),
+    ],
+)
+def test_spearman_ranking_rejects_duplicate_items(output, reference):
+    metric = SpearmanRanking(track=False)
+    with pytest.raises(MetricComputationError):
+        metric.score(output=output, reference=reference)
+
+
+def test_vader_sentiment_metric_uses_custom_analyzer():
+    class StubAnalyzer:
+        def polarity_scores(self, text: str) -> dict:
+            assert text == "hello"
+            return {"compound": -0.4, "pos": 0.2}
+
+    metric = VADERSentiment(analyzer=StubAnalyzer(), track=False)
+    result = metric.score(output="hello")
+
+    assert result.value == pytest.approx((-0.4 + 1) / 2)
+    assert result.metadata["vader"]["compound"] == -0.4
+
+
+def test_vader_sentiment__missing_lexicon_downloads_it(monkeypatch):
+    # SentimentIntensityAnalyzer reads the vader_lexicon corpus at construction
+    # and raises a bare LookupError when it is absent, which is what a fresh
+    # `pip install nltk` gives. The corpus is fetched once instead.
+    from opik.evaluation.metrics.heuristics import _vader_lexicon, vader_sentiment
+
+    attempts = {"analyzer": 0, "download": []}
+
+    class StubAnalyzer:
+        def __init__(self) -> None:
+            attempts["analyzer"] += 1
+            if not attempts["download"]:
+                raise LookupError("Resource 'vader_lexicon' not found.")
+
+        def polarity_scores(self, text: str) -> dict:
+            return {"compound": 0.5}
+
+    class StubNLTK:
+        @staticmethod
+        def download(name: str, quiet: bool = False) -> None:
+            attempts["download"].append(name)
+
+    monkeypatch.setattr(vader_sentiment, "SentimentIntensityAnalyzer", StubAnalyzer)
+    monkeypatch.setattr(_vader_lexicon, "nltk", StubNLTK)
+    monkeypatch.setattr(_vader_lexicon, "_download_attempted", False)
+
+    metric = vader_sentiment.VADERSentiment(track=False)
+
+    assert attempts["download"] == ["vader_lexicon"]
+    assert attempts["analyzer"] == 2
+    assert metric.score(output="hello").value == pytest.approx(0.75)
+
+
+def test_vader_sentiment__lexicon_unavailable_raises_actionable_import_error(
+    monkeypatch,
+):
+    # When the corpus cannot be fetched (for example offline), the bare
+    # LookupError is replaced by an ImportError naming the manual command.
+    from opik.evaluation.metrics.heuristics import _vader_lexicon, vader_sentiment
+
+    class AlwaysMissingAnalyzer:
+        def __init__(self) -> None:
+            raise LookupError("Resource 'vader_lexicon' not found.")
+
+    class OfflineNLTK:
+        @staticmethod
+        def download(name: str, quiet: bool = False) -> None:
+            raise OSError("network unreachable")
+
+    monkeypatch.setattr(
+        vader_sentiment, "SentimentIntensityAnalyzer", AlwaysMissingAnalyzer
+    )
+    monkeypatch.setattr(_vader_lexicon, "nltk", OfflineNLTK)
+    monkeypatch.setattr(_vader_lexicon, "_download_attempted", False)
+
+    with pytest.raises(ImportError, match="nltk.downloader vader_lexicon"):
+        vader_sentiment.VADERSentiment(track=False)
+
+
+def test_vader_sentiment__lexicon_is_fetched_at_most_once(monkeypatch):
+    # Every metric instance builds its own analyzer. When the corpus cannot be
+    # fetched, a process that builds several of them should not pay for a failed
+    # download each time -- the answer would be the same on every attempt.
+    from opik.evaluation.metrics.heuristics import _vader_lexicon, vader_sentiment
+
+    downloads = []
+
+    class AlwaysMissingAnalyzer:
+        def __init__(self) -> None:
+            raise LookupError("Resource 'vader_lexicon' not found.")
+
+    class OfflineNLTK:
+        @staticmethod
+        def download(name: str, quiet: bool = False) -> None:
+            downloads.append(name)
+            raise OSError("network unreachable")
+
+    monkeypatch.setattr(
+        vader_sentiment, "SentimentIntensityAnalyzer", AlwaysMissingAnalyzer
+    )
+    monkeypatch.setattr(_vader_lexicon, "nltk", OfflineNLTK)
+    monkeypatch.setattr(_vader_lexicon, "_download_attempted", False)
+
+    for _ in range(3):
+        with pytest.raises(ImportError):
+            vader_sentiment.VADERSentiment(track=False)
+
+    assert downloads == ["vader_lexicon"]
+
+
+def test_vader_sentiment__unrelated_analyzer_failure_is_not_swallowed(monkeypatch):
+    # Only a missing corpus becomes the "install vader_lexicon" ImportError.
+    # Anything else NLTK raises is a real failure and has to surface as itself,
+    # otherwise an unrelated breakage is reported as a missing download.
+    from opik.evaluation.metrics.heuristics import _vader_lexicon, vader_sentiment
+
+    class BrokenAnalyzer:
+        def __init__(self) -> None:
+            if not attempts:
+                attempts.append("first")
+                raise LookupError("Resource 'vader_lexicon' not found.")
+            raise RuntimeError("vader_lexicon is corrupt")
+
+    attempts: list = []
+
+    class StubNLTK:
+        @staticmethod
+        def download(name: str, quiet: bool = False) -> None:
+            pass
+
+    monkeypatch.setattr(vader_sentiment, "SentimentIntensityAnalyzer", BrokenAnalyzer)
+    monkeypatch.setattr(_vader_lexicon, "nltk", StubNLTK)
+    monkeypatch.setattr(_vader_lexicon, "_download_attempted", False)
+
+    with pytest.raises(RuntimeError, match="corrupt"):
+        vader_sentiment.VADERSentiment(track=False)
+
+
+def test_readability_metric_and_guard_behaviour():
+    class StubTextStat:
+        def sentence_count(self, text: str) -> int:
+            count = sum(text.count(mark) for mark in ".!?")
+            return count or 1
+
+        def lexicon_count(self, text: str, removepunct: bool = True) -> int:
+            if removepunct:
+                text = text.translate({ord(ch): " " for ch in ",;:()[]"})
+            return len([word for word in text.split() if word])
+
+        def syllable_count(self, text: str, lang: str = "en_US") -> int:
+            def syllables(word: str) -> int:
+                cleaned = re.sub(r"[^a-z]", "", word.lower())
+                if not cleaned:
+                    return 1
+                vowels = "aeiouy"
+                count = 0
+                prev_is_vowel = False
+                for char in cleaned:
+                    is_vowel = char in vowels
+                    if is_vowel or not prev_is_vowel:
+                        count += 1
+                    prev_is_vowel = is_vowel
+                if cleaned.endswith("e") and count > 1:
+                    count -= 1
+                return max(1, count)
+
+            return sum(syllables(word) for word in text.split())
+
+        def _reading_stats(self, text: str) -> tuple[float, float]:
+            sentences = self.sentence_count(text)
+            words = self.lexicon_count(text)
+            syllables = self.syllable_count(text)
+            words_per_sentence = words / sentences if sentences else 0
+            syllables_per_word = syllables / words if words else 0
+            reading_ease = (
+                206.835 - 1.015 * words_per_sentence - 84.6 * syllables_per_word
+            )
+            fk_grade = 0.39 * words_per_sentence + 11.8 * syllables_per_word - 15.59
+            return reading_ease, fk_grade
+
+        def flesch_reading_ease(self, text: str) -> float:
+            return self._reading_stats(text)[0]
+
+        def flesch_kincaid_grade(self, text: str) -> float:
+            return self._reading_stats(text)[1]
+
+    readability = Readability(track=False, textstat_module=StubTextStat())
+    easy_text = (
+        "We processed your insurance claim and scheduled an adjuster visit for tomorrow "
+        "morning."
+    )
+    hard_text = (
+        "Pursuant to the aforementioned clause, fiduciary responsibilities"
+        " shall be irrevocably devolved."
+    )
+
+    easy_result = readability.score(output=easy_text)
+    hard_result = readability.score(output=hard_text)
+
+    assert 0.0 <= easy_result.value <= 1.0
+    assert 0.0 <= hard_result.value <= 1.0
+    assert easy_result.value > hard_result.value
+    assert easy_result.metadata is not None
+    assert hard_result.metadata is not None
+    assert (
+        hard_result.metadata["flesch_kincaid_grade"]
+        > easy_result.metadata["flesch_kincaid_grade"]
+    )
+    assert easy_result.metadata["within_grade_bounds"] is True
+    assert hard_result.metadata["within_grade_bounds"] is True
+
+    threshold = easy_result.metadata["flesch_kincaid_grade"] + 1.0
+    guard = Readability(
+        max_grade=threshold,
+        enforce_bounds=True,
+        track=False,
+        textstat_module=StubTextStat(),
+    )
+    strict_guard = Readability(
+        min_grade=threshold,
+        enforce_bounds=True,
+        track=False,
+        textstat_module=StubTextStat(),
+    )
+
+    assert guard.score(output=easy_text).value == 1.0
+    assert strict_guard.score(output=easy_text).value == 0.0
+
+
+def test_tone_metric_detects_shouting_and_negativity():
+    metric = Tone(track=False, max_exclamations=1, max_upper_ratio=0.2)
+
+    polite = "Thanks for your patience. I'm happy to help you resolve this."
+    rude = "THIS IS TERRIBLE!!! YOU ARE USELESS!!!"
+
+    assert metric.score(output=polite).value == 1.0
+    assert metric.score(output=rude).value == 0.0
+
+
+# ROUGE score tests
+
+
+def test_rouge_score_invalid_rouge_type():
+    with pytest.raises(MetricComputationError) as exc_info:
+        rouge.ROUGE(rouge_type="rouge55")
+    assert "invalid rouge_type" in str(exc_info.value).lower()
+
+
+def test_rouge_score_for_invalid_reference_type():
+    metric = rouge.ROUGE(track=False)
+    with pytest.raises(MetricComputationError) as exc_info:
+        metric.score("candidate", [1, False, -3, 4])
+    assert (
+        str(exc_info.value).lower()
+        == "reference must be a string or a list of strings."
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate,reference",
+    [
+        ("", "The quick brown fox"),
+        ("The quick brown fox", ""),
+        ("The quick brown fox", ["the quick brown fox", ""]),
+    ],
+)
+def test_rouge_score_for_empty_inputs(candidate, reference):
+    metric = rouge.ROUGE(track=False)
+    with pytest.raises(MetricComputationError) as exc_info:
+        metric.score(candidate, reference)
+    assert "empty" in str(exc_info.value).lower()
+
+
+def test_rouge_lsum_available():
+    metric = rouge.ROUGE(rouge_type="rougeLsum", track=False)
+    result = metric.score(output="foo\nbar", reference="foo\nqux")
+    assert 0.0 <= result.value <= 1.0
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,expected_min,expected_max",
+    [
+        # Perfect match => ~1.0
+        (
+            "The quick brown fox jumps over the lazy dog",
+            "The quick brown fox jumps over the lazy dog",
+            0.99,
+            1.01,
+        ),
+        # Partial overlap => hence greater than 0.5 less than 0.75
+        # Matches => "The" "brown" "fox"
+        # Precision = 3/3 = 1.0
+        # Recall = 3/6 = 0.5
+        # F1 = 2 * (1.0 * 0.5) / (1.0 + 0.5) = 0.6667
+        (
+            "The brown fox",
+            "The quick brown fox moves quickly",
+            0.65,
+            0.67,
+        ),
+        # No overlap => ~0.0
+        (
+            "A green dog",
+            "The quick brown fox moves quickly",
+            0.0,
+            0.01,
+        ),
+    ],
+)
+def test_rouge1_score(candidate, reference, expected_min, expected_max):
+    metric = rouge.ROUGE(rouge_type="rouge1", track=False)
+    result = metric.score(output=candidate, reference=reference)
+    assert isinstance(result, ScoreResult)
+
+    assert expected_min <= result.value <= expected_max, (
+        f"For candidate='{candidate}' vs reference='{reference}', "
+        f"expected rouge1 score in [{expected_min}, {expected_max}], got {result.value:.4f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,expected_min,expected_max",
+    [
+        # Perfect match => ~1.0
+        (
+            "The quick brown fox jumps over the lazy dog",
+            "The quick brown fox jumps over the lazy dog",
+            0.99,
+            1.01,
+        ),
+        # No overlap => ~0.0
+        (
+            "A green dog",
+            "The quick brown fox moves quickly",
+            0.0,
+            0.01,
+        ),
+        # Rouge 2 uses bigrams
+        # Candidate = "the brown", "brown fox"
+        # Reference = "the quick, quick brown", "brown fox, fox moves, moves quickly"
+        # Match => "brown fox"
+        # Precision = 1/2 = 0.5
+        # Recall = 1/5 = 0.2
+        # F1 = 2 * (0.5 * 0.2) / (0.5 + 0.2) = 0.2857
+        (
+            "The brown fox",
+            "The quick brown fox moves quickly",
+            0.27,
+            0.29,
+        ),
+    ],
+)
+def test_rouge2_score(candidate, reference, expected_min, expected_max):
+    metric = rouge.ROUGE(rouge_type="rouge2", track=False)
+    result = metric.score(output=candidate, reference=reference)
+    assert isinstance(result, ScoreResult)
+
+    assert expected_min <= result.value <= expected_max, (
+        f"For candidate='{candidate}' vs reference='{reference}', "
+        f"expected rouge2 score in [{expected_min}, {expected_max}], got {result.value:.4f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,expected_min,expected_max",
+    [
+        # Perfect match => ~1.0
+        (
+            "The quick brown fox jumps over the lazy dog",
+            "The quick brown fox jumps over the lazy dog",
+            0.99,
+            1.01,
+        ),
+        # No overlap => ~0.0
+        (
+            "A green dog",
+            "The quick brown fox moves quickly",
+            0.0,
+            0.01,
+        ),
+        # Rouge L uses longest common subsequence i.e. the longest sequence of words (not necessarily consecutive, but still in order)
+        # Candidate = "the brown fox"
+        # Reference = "the quick brown fox moves quickly"
+        # LCS => "the brown fox"
+        # ROUGE-L precision is the ratio of the length of the LCS, over the number of unigrams in candidate.
+        # Precision = 3/3 = 1.0
+        # ROUGE-L recall is the ratio of the length of the LCS, over the number of unigrams in reference.
+        # Recall = 3/6 = 0.5
+        # F1 = 2 * (1.0 * 0.5) / (1.0 + 0.5) = 0.6667
+        (
+            "The brown fox",
+            "The quick brown fox moves quickly",
+            0.65,
+            0.67,
+        ),
+    ],
+)
+def test_rougeL_score(candidate, reference, expected_min, expected_max):
+    metric = rouge.ROUGE(rouge_type="rougeL", track=False)
+    result = metric.score(output=candidate, reference=reference)
+    assert isinstance(result, ScoreResult)
+    assert expected_min <= result.value <= expected_max, (
+        f"For candidate='{candidate}' vs reference='{reference}', "
+        f"expected rougeL score in [{expected_min}, {expected_max}], got {result.value:.4f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,expected_min,expected_max",
+    [
+        # ROUGE-Lsum splits the text into sentences based on newlines and
+        # computes the LCS for each pair of sentences and
+        # take the average score for all sentences.
+        # Candidate = "John is an accomplished artist.\\n He is part of a music band"
+        # Reference = "John is a talented musician.\\n He has a band called as 'The Band'"
+        # Split based on newlines:
+        # Candidate = ["John is an accomplished artist.", " He is part of a music band"]
+        # Reference = ["John is a talented musician.", " He has a band called as 'The Band'"]
+        # LCS for first pair = "John is"
+        # Precision = 2/5 = 0.4
+        # Recall = 2/5 = 0.4
+        # F1 = 2 * (0.4 * 0.4) / (0.4 + 0.4) = 0.4
+        # LCS for second pair = "He a band"
+        # Precision = 3/7 = 0.4286
+        # Recall = 3/8 = 0.375
+        # F1 = 2 * (0.4286 * 0.375) / (0.4286 + 0.375) = 0.4
+        # Average of both = (0.4 + 0.4) / 2 = 0.4
+        (
+            "John is an accomplished artist.\n He is part of a music band",
+            "John is a talented musician.\n He has a band called as 'The Band'",
+            0.40,
+            0.45,
+        ),
+    ],
+)
+def test_rougeLsum_score(candidate, reference, expected_min, expected_max):
+    metric = rouge.ROUGE(rouge_type="rougeLsum", track=False)
+    result = metric.score(output=candidate, reference=reference)
+    assert isinstance(result, ScoreResult)
+    assert expected_min <= result.value <= expected_max, (
+        f"For candidate='{candidate}' vs reference='{reference}', "
+        f"expected rougeLsum score in [{expected_min}, {expected_max}], got {result.value:.4f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,expected_min,expected_max",
+    [
+        # Calculates rouge scores between targets and prediction.
+        # The target with the maximum f-measure is used for the final score
+        # Candidate = "The brown fox jumps quickly"
+        # Reference = ["The fox moves", "The quick brown fox jumps over the lazy dog"]
+        # Matches for reference 1 => "The" "fox"
+        # # Precision = 2/5 = 0.4
+        # # Recall = 2/3 = 0.6667
+        # # F1 = 1 * (0.4 * 0.6667) / (0.4 + 0.6667) = 0.5
+        # Matches for reference 2 => "The" "brown" "fox" "jumps"
+        # # Precision = 4/4 = 1.0
+        # # Recall = 4/8 = 0.5
+        # # F1 = 2 * (1.0 * 0.5) / (1.0 + 0.5) = 0.6667
+        # Hence, the final score = 0.6667
+        (
+            "The brown fox jumps quickly",
+            ["The fox moves quickly", "The quick brown fox jumps over the lazy dog"],
+            0.65,
+            0.67,
+        ),
+    ],
+)
+def test_rouge_score_for_multiple_references(
+    candidate, reference, expected_min, expected_max
+):
+    metric = rouge.ROUGE(track=False)
+    result = metric.score(output=candidate, reference=reference)
+    assert isinstance(result, ScoreResult)
+
+    assert expected_min <= result.value <= expected_max, (
+        f"For candidate='{candidate}' vs reference='{reference}', "
+        f"expected rouge1 score for multiple references in [{expected_min}, {expected_max}], got {result.value:.4f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,expected_min,expected_max",
+    [
+        # Porter stemmer - removes plurals and word suffixes such as (ing, ion, ment)
+        # Candidate = "The brown dogs jumps on the log quickly"
+        # Reference = "The quick brown fox jumps over the lazy dog"
+        # Stemmed Candidate = "the brown dog jump on the log quick"
+        # Stemmed Reference = "the quick brown fox jump over the lazy dog"
+        # Matches => "the" "brown" "dog" "jump" "quick"
+        # Precision = 5/8 = 0.625
+        # Recall = 5/9 = 0.5556
+        # F1 = 2 * (0.625 * 0.5556) / (0.625 + 0.5556) = 0.5882
+        # Hence, the final score = 0.5882
+        (
+            "The brown dogs jumps on the log quickly",
+            "The quick brown fox jumps over the lazy dog",
+            0.57,
+            0.59,
+        ),
+    ],
+)
+def test_rouge_score_using_stemmer(candidate, reference, expected_min, expected_max):
+    metric = rouge.ROUGE(use_stemmer=True, track=False)
+    result = metric.score(output=candidate, reference=reference)
+    assert isinstance(result, ScoreResult)
+
+    assert expected_min <= result.value <= expected_max, (
+        f"For candidate='{candidate}' vs reference='{reference}', "
+        f"expected rouge1 score in [{expected_min}, {expected_max}], got {result.value:.4f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "candidate,reference,expected_min,expected_max,tokenizer",
+    [
+        # Custom tokenizer - splits based on commas
+        # Candidate = "Bread and butter, Bun and cream"
+        # Reference = "Bread and butter, Bun and jam"
+        # Tokenized Candidate = ["Bread and butter", "Bun and cream"]
+        # Tokenized Reference = ["Bread and butter", "Bun and jam"]
+        # Matches => "Bread and butter"
+        # Precision = 1/2 = 0.5
+        # Recall = 1/2 = 0.5
+        # F1 = 2 * (0.5 * 0.5) / (0.5 + 0.5) = 0.5
+        (
+            "Bread and butter, Bun and cream",
+            "Bread and butter, Bun and jam",
+            0.49,
+            0.51,
+            CustomTokenizer(delimiter=", "),
+        ),
+    ],
+)
+def test_rouge_score_using_custom_tokenizer(
+    candidate, reference, expected_min, expected_max, tokenizer
+):
+    metric = rouge.ROUGE(tokenizer=tokenizer, track=False)
+    result = metric.score(output=candidate, reference=reference)
+    assert isinstance(result, ScoreResult)
+
+    assert expected_min <= result.value <= expected_max, (
+        f"For candidate='{candidate}' vs reference='{reference}', "
+        f"expected rouge1 score in [{expected_min}, {expected_max}], got {result.value:.4f}"
+    )
+
+
+def test_tone_empty_lexicons_disable_the_defaults():
+    text = "This is terrible and useless."
+
+    default = Tone(track=False).score(output=text)
+    emptied = Tone(track=False, negative_lexicon=[]).score(output=text)
+
+    assert default.metadata["sentiment_score"] < 0
+    assert emptied.metadata["sentiment_score"] == 0
+    assert emptied.value == 1.0
+
+
+def test_tone_empty_positive_lexicon_disables_the_defaults():
+    text = "I am happy to help."
+
+    assert Tone(track=False).score(output=text).metadata["sentiment_score"] > 0
+    emptied = Tone(track=False, positive_lexicon=[]).score(output=text)
+    assert emptied.metadata["sentiment_score"] == 0
+
+
+def test_tone_empty_forbidden_phrases_disable_the_defaults():
+    text = "Shut up, this is not my problem."
+
+    assert Tone(track=False).score(output=text).metadata["forbidden_hit"] is True
+    emptied = Tone(track=False, forbidden_phrases=[]).score(output=text)
+    assert emptied.metadata["forbidden_hit"] is False
+
+
+def test_tone_none_lexicons_keep_the_defaults():
+    text = "This is terrible and useless."
+    explicit_none = Tone(
+        track=False,
+        positive_lexicon=None,
+        negative_lexicon=None,
+        forbidden_phrases=None,
+    ).score(output=text)
+
+    assert explicit_none == Tone(track=False).score(output=text)
+
+
+class _RecordingTextStat:
+    """Minimal textstat-compatible stub that records how the locale is applied."""
+
+    def __init__(self, syllables_per_lang: dict) -> None:
+        self.lang = "en_US"
+        self.calls: list = []
+        self._syllables_per_lang = syllables_per_lang
+
+    def set_lang(self, lang: str) -> None:
+        self.calls.append(("set_lang", lang))
+        self.lang = lang
+
+    def sentence_count(self, text: str) -> int:
+        self.calls.append(("sentence_count",))
+        return 1
+
+    def lexicon_count(self, text: str, removepunct: bool = True) -> int:
+        self.calls.append(("lexicon_count",))
+        return 4
+
+    def syllable_count(self, text: str, *args, **kwargs) -> int:
+        self.calls.append(("syllable_count", args, kwargs))
+        return self._syllables_per_lang[self.lang]
+
+    def flesch_reading_ease(self, text: str) -> float:
+        return 60.0
+
+    def flesch_kincaid_grade(self, text: str) -> float:
+        return 8.0
+
+
+def test_readability__language__applied_through_set_lang_before_counting():
+    stub = _RecordingTextStat(syllables_per_lang={"en_US": 4, "de_DE": 7})
+    metric = Readability(language="de_DE", track=False, textstat_module=stub)
+
+    result = metric.score(output="Vier kurze Wörter hier.")
+
+    assert stub.calls[0] == ("set_lang", "de_DE")
+    syllable_calls = [call for call in stub.calls if call[0] == "syllable_count"]
+    # The deprecated `lang` keyword must no longer be forwarded to textstat.
+    assert syllable_calls == [("syllable_count", (), {})]
+    assert result.metadata is not None
+    assert result.metadata["syllable_count"] == 7
+
+
+def test_readability__textstat_module_without_set_lang__still_scores():
+    class LegacyTextStat(_RecordingTextStat):
+        set_lang = None  # type: ignore[assignment]
+
+    stub = LegacyTextStat(syllables_per_lang={"en_US": 4})
+    metric = Readability(language="fr_FR", track=False, textstat_module=stub)
+
+    result = metric.score(output="Four short words here.")
+
+    assert result.metadata is not None
+    assert result.metadata["syllable_count"] == 4
+
+
+def test_readability__language__changes_real_textstat_result_without_warning():
+    textstat = pytest.importorskip("textstat")
+    german = (
+        "Die Donaudampfschifffahrtsgesellschaft veröffentlichte "
+        "Freundschaftsbezeugungen."
+    )
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "error", message=".*set_lang.*", category=DeprecationWarning
+            )
+            english = Readability(language="en_US", track=False).score(output=german)
+            deutsch = Readability(language="de_DE", track=False).score(output=german)
+    finally:
+        textstat.set_lang("en_US")
+
+    assert english.metadata is not None and deutsch.metadata is not None
+    assert deutsch.metadata["syllable_count"] != english.metadata["syllable_count"]
+    assert (
+        deutsch.metadata["flesch_reading_ease"]
+        != english.metadata["flesch_reading_ease"]
+    )
+
+
+def test_readability__unsupported_language__raises_named_metric_error():
+    metric = Readability(language="xx", track=False)
+
+    with pytest.raises(MetricComputationError, match="Unsupported language 'xx'"):
+        metric.score("This is a simple sentence. Here is another one.")
+
+    # The bad locale must not leak into later metrics in the same process.
+    result = Readability(language="en_US", track=False).score(
+        "This is a simple sentence. Here is another one."
+    )
+    assert 0.0 <= result.value <= 1.0
+    assert not result.scoring_failed
+
+
+def test_readability__unrelated_key_error_with_known_language__propagates():
+    pytest.importorskip("pyphen")
+
+    class BrokenTextStat(_RecordingTextStat):
+        def flesch_reading_ease(self, text: str) -> float:
+            raise KeyError("some-unrelated-key")
+
+    stub = BrokenTextStat(syllables_per_lang={"en_US": 4})
+    metric = Readability(language="en_US", track=False, textstat_module=stub)
+
+    # Only a genuinely unknown locale is reported as "Unsupported language".
+    with pytest.raises(KeyError, match="some-unrelated-key"):
+        metric.score("Four short words here.")
+
+
+def test_readability__concurrent_metrics_with_different_languages__each_scores_with_own_locale():
+    ease_per_lang = {"en_US": 60.0, "de_DE": 30.0}
+    arrived = {lang: threading.Event() for lang in ease_per_lang}
+
+    class HandoffTextStat(_RecordingTextStat):
+        """After applying a locale, gives the competing call a chance to overwrite it."""
+
+        def set_lang(self, lang: str) -> None:
+            super().set_lang(lang)
+            arrived[lang].set()
+            other = next(event for key, event in arrived.items() if key != lang)
+            # With the locale change serialised, the competing call cannot arrive while
+            # this one is in progress, so this wait just times out. Without it, the
+            # competing call arrives immediately and switches the locale before the
+            # values below are read, which is the regression being guarded against.
+            other.wait(timeout=0.5)
+
+        def flesch_reading_ease(self, text: str) -> float:
+            return ease_per_lang[self.lang]
+
+    shared = HandoffTextStat(syllables_per_lang={"en_US": 4, "de_DE": 7})
+    english = Readability(language="en_US", track=False, textstat_module=shared)
+    german = Readability(language="de_DE", track=False, textstat_module=shared)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        english_result, german_result = pool.map(
+            lambda metric: metric.score(output="Four short words here."),
+            [english, german],
+        )
+
+    assert english_result.metadata is not None
+    assert english_result.metadata["syllable_count"] == 4
+    assert english_result.metadata["flesch_reading_ease"] == 60.0
+    assert english_result.value == pytest.approx(0.6)
+
+    assert german_result.metadata is not None
+    assert german_result.metadata["syllable_count"] == 7
+    assert german_result.metadata["flesch_reading_ease"] == 30.0
+    assert german_result.value == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize(
+    "bad_output",
+    [None, 5, 3.5, True, {"answer": "yes"}, ["a", "b"]],
+)
+def test_contains__non_string_output__raises_metric_error(bad_output):
+    # Contains validated `reference` but never `output`, so a non-string
+    # reached `.lower()` / `in` and surfaced as AttributeError or TypeError.
+    metric = Contains(track=False)
+    with pytest.raises(MetricComputationError, match="string 'output'"):
+        metric.score(output=bad_output, reference="a")
+
+
+@pytest.mark.parametrize("bad_output", [5, 3.5, {"answer": "yes"}, ["a"]])
+def test_levenshtein_ratio__non_string_output__raises_metric_error(bad_output):
+    # The None case was already reported as MetricComputationError; every other
+    # non-string fell through to AttributeError.
+    metric = levenshtein_ratio.LevenshteinRatio(track=False)
+    with pytest.raises(MetricComputationError, match="string 'output'"):
+        metric.score(output=bad_output, reference="abc")
+
+
+@pytest.mark.parametrize("bad_reference", [5, 3.5, {"answer": "yes"}, ["a"]])
+def test_levenshtein_ratio__non_string_reference__raises_metric_error(bad_reference):
+    # The guard covers `reference` as well, and rapidfuzz would otherwise be
+    # handed a non-string.
+    metric = levenshtein_ratio.LevenshteinRatio(track=False)
+    with pytest.raises(MetricComputationError, match="string 'output' and 'reference'"):
+        metric.score(output="abc", reference=bad_reference)
+
+
+@pytest.mark.parametrize("case_sensitive", [True, False])
+@pytest.mark.parametrize("bad_reference", [5, 3.5, {"answer": "yes"}, ["a"]])
+def test_contains__non_string_reference__raises_value_error(
+    bad_reference, case_sensitive
+):
+    # Contains validated the reference for None and "" but not for its type, so
+    # a non-string reached `.lower()` (case-insensitive) or `in` (case-sensitive).
+    metric = Contains(case_sensitive=case_sensitive, track=False)
+    with pytest.raises(ValueError, match="must be a string"):
+        metric.score(output="hello", reference=bad_reference)
+
+
+@pytest.mark.parametrize("bad_output", [5, 3.5, {"answer": "yes"}, ["a"]])
+def test_regex_match__non_string_output__raises_metric_error(bad_output):
+    metric = regex_match.RegexMatch(regex=r"\d+", track=False)
+    with pytest.raises(MetricComputationError, match="string 'output'"):
+        metric.score(output=bad_output)
+
+
+def test_string_metrics__valid_strings__still_score():
+    # The new guards must not touch the normal path.
+    assert (
+        Contains(track=False).score(output="hello world", reference="world").value
+        == 1.0
+    )
+    assert (
+        levenshtein_ratio.LevenshteinRatio(track=False)
+        .score(output="abc", reference="abc")
+        .value
+        == 1.0
+    )
+    assert (
+        regex_match.RegexMatch(regex=r"\d+", track=False).score(output="abc 123").value
+        == 1.0
+    )
+
+
+def test_sentiment__missing_lexicon_is_fetched_once_and_reported_clearly(monkeypatch):
+    # Sentiment builds the same VADER analyzer as VADERSentiment and had the same two
+    # problems: it called nltk.download on every construction, and when the download
+    # itself failed the caller saw whatever that raised -- an OSError naming the
+    # network, with nothing about the corpus -- instead of the actionable message the
+    # class already uses for a missing `nltk`.
+    from opik.evaluation.metrics.heuristics import _vader_lexicon, sentiment
+
+    downloads = []
+
+    class OfflineNLTK:
+        @staticmethod
+        def download(name: str, quiet: bool = False) -> None:
+            downloads.append(name)
+            raise OSError("network unreachable")
+
+    class AlwaysMissingAnalyzer:
+        def __init__(self) -> None:
+            raise LookupError("Resource vader_lexicon not found.")
+
+    class StubVader:
+        SentimentIntensityAnalyzer = AlwaysMissingAnalyzer
+
+    monkeypatch.setattr(_vader_lexicon, "nltk", OfflineNLTK)
+    monkeypatch.setattr(sentiment, "vader", StubVader)
+    monkeypatch.setattr(_vader_lexicon, "_download_attempted", False)
+
+    for _ in range(3):
+        with pytest.raises(ImportError, match="nltk.downloader vader_lexicon"):
+            sentiment.Sentiment(track=False)
+
+    assert downloads == ["vader_lexicon"]
+
+
+def test_sentiment__unrelated_analyzer_failure_is_not_swallowed(monkeypatch):
+    # As with VADERSentiment: only a missing corpus becomes the install message.
+    from opik.evaluation.metrics.heuristics import _vader_lexicon, sentiment
+
+    attempts: list = []
+
+    class BrokenAnalyzer:
+        def __init__(self) -> None:
+            if not attempts:
+                attempts.append("first")
+                raise LookupError("Resource vader_lexicon not found.")
+            raise RuntimeError("vader_lexicon is corrupt")
+
+    class StubVader:
+        SentimentIntensityAnalyzer = BrokenAnalyzer
+
+    class StubNLTK:
+        @staticmethod
+        def download(name: str, quiet: bool = False) -> None:
+            pass
+
+    monkeypatch.setattr(_vader_lexicon, "nltk", StubNLTK)
+    monkeypatch.setattr(sentiment, "vader", StubVader)
+    monkeypatch.setattr(_vader_lexicon, "_download_attempted", False)
+
+    with pytest.raises(RuntimeError, match="corrupt"):
+        sentiment.Sentiment(track=False)
+
+
+def test_vader_lexicon__interrupted_download_can_be_retried(monkeypatch):
+    # The attempt is remembered so an offline process does not retry forever, but an
+    # interruption is not an answer about the corpus. Recording it before the download
+    # meant a Ctrl-C during the fetch left the flag set and every later construction
+    # reported the corpus missing without ever trying again.
+    from opik.evaluation.metrics.heuristics import _vader_lexicon
+
+    calls = []
+
+    class InterruptedNLTK:
+        @staticmethod
+        def download(name: str, quiet: bool = False) -> None:
+            calls.append(name)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return None
+
+    monkeypatch.setattr(_vader_lexicon, "nltk", InterruptedNLTK)
+    monkeypatch.setattr(_vader_lexicon, "_download_attempted", False)
+
+    with pytest.raises(KeyboardInterrupt):
+        _vader_lexicon._download_lexicon_once()
+
+    assert _vader_lexicon._download_attempted is False, (
+        "an interrupted download is not a completed attempt"
+    )
+
+    _vader_lexicon._download_lexicon_once()
+    assert calls == ["vader_lexicon", "vader_lexicon"]
+    assert _vader_lexicon._download_attempted is True

@@ -1,0 +1,127 @@
+import sys
+from unittest.mock import patch
+
+from opik.configurator.interactive_helpers import (
+    ask_user_for_approval,
+    is_interactive,
+)
+
+
+class TestIsInteractive:
+    @patch(
+        "opik.configurator.interactive_helpers._in_colab_environment",
+        return_value=False,
+    )
+    @patch(
+        "opik.configurator.interactive_helpers._in_ipython_environment",
+        return_value=False,
+    )
+    @patch(
+        "opik.configurator.interactive_helpers._in_jupyter_environment",
+        return_value=False,
+    )
+    @patch.object(sys.stdin, "isatty", return_value=True)
+    def test_is_interactive__true(
+        self,
+        isatty,
+        _in_jupyter_environment,
+        _in_ipython_environment,
+        _in_colab_environment,
+    ):
+        assert is_interactive() is True
+
+    @patch(
+        "opik.configurator.interactive_helpers._in_colab_environment",
+        return_value=False,
+    )
+    @patch(
+        "opik.configurator.interactive_helpers._in_ipython_environment",
+        return_value=False,
+    )
+    @patch(
+        "opik.configurator.interactive_helpers._in_jupyter_environment",
+        return_value=False,
+    )
+    @patch.object(sys.stdin, "isatty", return_value=False)
+    def test_is_interactive__false(
+        self,
+        isatty,
+        _in_jupyter_environment,
+        _in_ipython_environment,
+        _in_colab_environment,
+    ):
+        assert is_interactive() is False
+
+
+class TestAskUserForApproval:
+    @patch("builtins.input", return_value="Y")
+    def test_user_approves_with_y(self, mock_input):
+        """
+        Test that 'Y' returns True for approval.
+        """
+        result = ask_user_for_approval("Do you approve?")
+        assert result is True
+
+    @patch("builtins.input", return_value="YES")
+    def test_user_approves_with_yes(self, mock_input):
+        """
+        Test that 'YES' returns True for approval.
+        """
+        result = ask_user_for_approval("Do you approve?")
+        assert result is True
+
+    @patch("builtins.input", return_value="")
+    def test_user_approves_with_empty_input(self, mock_input):
+        """
+        Test that empty input returns True for approval.
+        """
+        result = ask_user_for_approval("Do you approve?")
+        assert result is True
+
+    @patch("builtins.input", return_value="N")
+    def test_user_disapproves_with_n(self, mock_input):
+        """
+        Test that 'N' returns False for disapproval.
+        """
+        result = ask_user_for_approval("Do you disapprove?")
+        assert result is False
+
+    @patch("builtins.input", return_value="NO")
+    def test_user_disapproves_with_no(self, mock_input):
+        """
+        Test that 'NO' returns False for disapproval.
+        """
+        result = ask_user_for_approval("Do you disapprove?")
+        assert result is False
+
+    @patch("builtins.input", side_effect=["INVALID", "Y"])
+    def test_user_enters_invalid_choice_then_approves(self, mock_input, capsys):
+        """
+        Invalid input is answered in the terminal, like the prompt, and asked again.
+        """
+        result = ask_user_for_approval("Do you approve?")
+        assert result is True
+        assert capsys.readouterr().out == "  Please answer y or n.\n"
+
+    @patch("builtins.input", side_effect=["INVALID", "NO"])
+    def test_user_enters_invalid_choice_then_disapproves(self, mock_input, capsys):
+        """
+        Invalid input is answered in the terminal, like the prompt, and asked again.
+        """
+        result = ask_user_for_approval("Do you disapprove?")
+        assert result is False
+        assert capsys.readouterr().out == "  Please answer y or n.\n"
+
+
+class TestTheQuestionIsWordedHere:
+    """The caller passes the question; the `[Y/n]` and the indent are added here.
+
+    Every call site used to spell its own suffix, which is how `(Y/n)` with the
+    cursor against the bracket ended up next to the CLI's `[Y/n]: `.
+    """
+
+    @patch("builtins.input", return_value="y")
+    def test_the_prompt_matches_the_cli_shape(self, mock_input):
+        ask_user_for_approval("Use it?")
+
+        assert mock_input.call_args.args[0] == "  Use it? [Y/n]: "

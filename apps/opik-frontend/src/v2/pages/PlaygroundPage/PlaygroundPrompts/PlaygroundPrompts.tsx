@@ -1,0 +1,101 @@
+import { useEffect } from "react";
+
+import PlaygroundPrompt from "@/v2/pages/PlaygroundPage/PlaygroundPrompts/PlaygroundPrompt";
+import { COMPOSED_PROVIDER_TYPE } from "@/types/providers";
+import { PLAYGROUND_LAST_PICKED_MODEL } from "@/constants/llm";
+import {
+  usePromptCount,
+  usePromptIds,
+  useSetPromptMap,
+} from "@/store/PlaygroundStore";
+import useLastPickedModel from "@/hooks/useLastPickedModel";
+import useLLMProviderModelsData from "@/hooks/useLLMProviderModelsData";
+import { generateDefaultPrompt } from "@/lib/playground";
+
+interface PlaygroundPromptsProps {
+  workspaceName: string;
+  providerKeys: COMPOSED_PROVIDER_TYPE[];
+  isPendingProviderKeys: boolean;
+  hasLoadedProviderKeys: boolean;
+  runSingle?: (promptId: string) => void;
+  stopSingle?: (promptId: string) => void;
+  checkAgain?: () => void;
+}
+
+const PlaygroundPrompts = ({
+  workspaceName,
+  providerKeys,
+  isPendingProviderKeys,
+  hasLoadedProviderKeys,
+  runSingle,
+  stopSingle,
+  checkAgain,
+}: PlaygroundPromptsProps) => {
+  const promptCount = usePromptCount();
+  const promptIds = usePromptIds();
+  const setPromptMap = useSetPromptMap();
+  const showPerPromptRunControls = promptCount > 1;
+
+  const [lastPickedModel] = useLastPickedModel({
+    key: PLAYGROUND_LAST_PICKED_MODEL,
+  });
+  const {
+    calculateModelProvider,
+    calculateDefaultModel,
+    isDropdownModel,
+    hasRegistryModels,
+  } = useLLMProviderModelsData();
+
+  useEffect(() => {
+    if (promptCount === 0 && !isPendingProviderKeys) {
+      const newPrompt = generateDefaultPrompt({
+        setupProviders: providerKeys,
+        lastPickedModel,
+        providerResolver: calculateModelProvider,
+        modelResolver: calculateDefaultModel,
+        isDropdownModel,
+      });
+      setPromptMap([newPrompt.id], { [newPrompt.id]: newPrompt });
+    }
+  }, [
+    promptCount,
+    isPendingProviderKeys,
+    providerKeys,
+    lastPickedModel,
+    calculateModelProvider,
+    calculateDefaultModel,
+    isDropdownModel,
+    setPromptMap,
+  ]);
+
+  return (
+    <div className="flex min-h-0 min-w-0 flex-1">
+      {promptIds.map((promptId, idx) => (
+        <PlaygroundPrompt
+          workspaceName={workspaceName}
+          promptId={promptId}
+          index={idx}
+          key={promptId}
+          providerKeys={providerKeys}
+          hasLoadedProviderKeys={hasLoadedProviderKeys}
+          hasRegistryModels={hasRegistryModels}
+          providerResolver={calculateModelProvider}
+          modelResolver={calculateDefaultModel}
+          onRun={
+            showPerPromptRunControls && runSingle
+              ? () => runSingle(promptId)
+              : undefined
+          }
+          onStop={
+            showPerPromptRunControls && stopSingle
+              ? () => stopSingle(promptId)
+              : undefined
+          }
+          onCheckAgain={checkAgain}
+        />
+      ))}
+    </div>
+  );
+};
+
+export default PlaygroundPrompts;

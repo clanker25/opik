@@ -1,0 +1,189 @@
+package com.comet.opik.api.resources.v1.events;
+
+import com.comet.opik.api.AgentInsightsJob;
+import com.comet.opik.domain.AgentInsightsJobService;
+import com.comet.opik.domain.AgentInsightsMetrics;
+import com.comet.opik.domain.AgentInsightsReportClient;
+import com.comet.opik.domain.AgentInsightsReportMessage;
+import com.comet.opik.domain.AgentInsightsRunGuidanceService;
+import com.comet.opik.domain.AgentInsightsTriggerException;
+import com.comet.opik.infrastructure.AgentInsightsReportConfig;
+import com.comet.opik.infrastructure.ServiceTogglesConfig;
+import jakarta.inject.Inject;
+import lombok.NonNull;
+import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RedissonReactiveClient;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+import ru.vyarus.dropwizard.guice.module.installer.feature.eager.EagerSingleton;
+import ru.vyarus.dropwizard.guice.module.yaml.bind.Config;
+
+/**
+ * Consumes queued Agent Insights report triggers (published by {@code AgentInsightsReportPublisher}) and
+ * performs the actual report call via {@link AgentInsightsReportClient}. The Redis consumer group caps
+ * concurrent runs, so neither the manual {@code /trigger} endpoint nor the daily sweep blocks on the call.
+ */
+@Slf4j
+@EagerSingleton
+public class AgentInsightsReportSubscriber extends BaseRedisSubscriber<AgentInsightsReportMessage> {
+
+    private static final String METRICS_NAMESPACE = "opik";
+    private static final String METRICS_BASE_NAME = "agent_insights_report";
+
+    private final AgentInsightsReportConfig config;
+    private final ServiceTogglesConfig serviceToggles;
+    private final AgentInsightsReportClient reportClient;
+    private final AgentInsightsJobService jobService;
+    private final AgentInsightsRunGuidanceService runGuidanceService;
+
+    @Inject
+    public AgentInsightsReportSubscriber(
+            @NonNull @Config("agentInsightsReport") AgentInsightsReportConfig config,
+            @NonNull @Config("serviceToggles") ServiceTogglesConfig serviceToggles,
+            @NonNull RedissonReactiveClient redisson,
+            @NonNull AgentInsightsReportClient reportClient,
+            @NonNull AgentInsightsJobService jobService,
+            @NonNull AgentInsightsRunGuidanceService runGuidanceService) {
+        super(config, redisson, AgentInsightsReportConfig.PAYLOAD_FIELD, METRICS_NAMESPACE, METRICS_BASE_NAME);
+        this.config = config;
+        this.serviceToggles = serviceToggles;
+        this.reportClient = reportClient;
+        this.jobService = jobService;
+        this.runGuidanceService = runGuidanceService;
+    }
+
+    @Override
+    public void start() {
+        if (isDisabled()) {
+            return;
+        }
+        log.info("Starting Agent Insights report subscriber with config: streamName='{}', consumerGroupName='{}', "
+                + "batchSize='{}'", config.getStreamName(), config.getConsumerGroupName(),
+                config.getConsumerBatchSize());
+        super.start();
+    }
+
+    @Override
+    public void stop() {
+        if (isDisabled()) {
+            return;
+        }
+        log.info("Stopping Agent Insights report subscriber");
+        super.stop();
+    }
+
+    @Override
+    protected Mono<Void> processEvent(@NonNull AgentInsightsReportMessage message) {
+        log.info("Processing Agent Insights report trigger: reportId='{}', project='{}', workspace='{}', "
+                + "guidanceVersion='{}'", message.reportId(), message.projectId(), message.workspaceId(),
+                message.guidanceVersion());
+
+        // Default a null (legacy message queued before triggerSource existed) to the scheduled sweep.
+        String triggerSource = message.triggerSource() != null
+                ? message.triggerSource()
+                : AgentInsightsMetrics.SCHEDULED;
+
+        // Re-checked here so turning guidance off also drops it from runs already queued.
+        boolean guidanceActive = serviceToggles.isAgentInsightsGuidanceActive();
+        String guidance = guidanceActive ? message.guidance() : null;
+        int stamped = AgentInsightsRunGuidanceService.stampOf(message.guidanceVersion());
+        if (!guidanceActive && stamped != AgentInsightsRunGuidanceService.NO_GUIDANCE) {
+            // The run goes out without its guidance: its results reflect none.
+            replaceRunGuidanceStamp(message, stamped, AgentInsightsRunGuidanceService.NO_GUIDANCE);
+            stamped = AgentInsightsRunGuidanceService.NO_GUIDANCE;
+        }
+        int stampedForRun = stamped;
+        var trigger = AgentInsightsReportClient.Trigger.builder()
+                .reportId(message.reportId())
+                .projectId(message.projectId())
+                .workspaceId(message.workspaceId())
+                .periodStart(message.periodStart())
+                .periodEnd(message.periodEnd())
+                .triggerSource(triggerSource)
+                .guidance(guidance)
+                .build();
+
+        return Mono.fromRunnable(() -> reportClient.triggerAgentInsights(trigger))
+                .subscribeOn(Schedulers.boundedElastic())
+                .then()
+                .doOnSuccess(unused -> {
+                    // The base class records every message as success because processEvent swallows failures
+                    // (at-most-once drop), so its processing-errors metric never fires for a failed trigger.
+                    // This counter restores the success/failure outcome signal for the platform trigger call.
+                    AgentInsightsMetrics.REPORTS_TRIGGERED.add(1, AgentInsightsMetrics.OUTCOME_SUCCESS);
+                    log.info("Triggered Agent Insights report: reportId='{}', project='{}'",
+                            message.reportId(), message.projectId());
+                })
+                .onErrorResume(throwable -> {
+                    AgentInsightsMetrics.REPORTS_TRIGGERED.add(1, AgentInsightsMetrics.OUTCOME_FAILURE);
+                    // At-most-once on purpose: report generation is a non-idempotent side effect (Ollie
+                    // compute + a user-facing report), and the trigger isn't deduplicated downstream, so a
+                    // redelivery would run the same report twice. We ack on failure (log + complete) rather
+                    // than rethrow; the run is dropped (best-effort daily briefing) instead of duplicated.
+                    // reportId is carried on the message as the idempotency key if downstream dedup is added.
+                    log.error("Failed to trigger Agent Insights report, dropping reportId='{}', project='{}'",
+                            message.reportId(), message.projectId(), throwable);
+                    // Ollie never ran, so it can't report this itself: record the reason so the UI stops.
+                    markRunFailed(message, throwable);
+                    // Nor did it get the guidance, so a later report must not be recorded under this stamp.
+                    replaceRunGuidanceStamp(message, stampedForRun, null);
+                    return Mono.empty();
+                });
+    }
+
+    /**
+     * The publisher stamped the run with the guidance version it was queued with. When the run goes out without that
+     * guidance (turned off since) the stamp becomes "no guidance"; when it never runs (trigger failed) it is cleared,
+     * so a report doesn't record results under guidance they were never produced with.
+     * Best-effort, like the stamp itself: a miss only leaves the "guidance changed" callout less precise.
+     */
+    private void replaceRunGuidanceStamp(AgentInsightsReportMessage message, int stamped, Integer replacement) {
+        try {
+            runGuidanceService.replaceIfStamped(message.workspaceId(), message.projectId(), stamped, replacement);
+        } catch (RuntimeException e) {
+            log.warn("Failed to replace the guidance version stamp '{}' with '{}' for a queued Agent Insights run, "
+                    + "reportId='{}', project='{}'", stamped, replacement, message.reportId(), message.projectId(), e);
+        }
+    }
+
+    private void markRunFailed(AgentInsightsReportMessage message, Throwable throwable) {
+        String reason = throwable instanceof AgentInsightsTriggerException triggerFailure
+                ? triggerFailure.getReason()
+                : AgentInsightsJob.FailureReason.DID_NOT_START;
+        if (AgentInsightsJob.FailureReason.FREE_POOL_EXHAUSTED.equals(reason)) {
+            if (AgentInsightsMetrics.AUTO_FIRST_RUN.equals(message.triggerSource())) {
+                cancelAutoFirstRunRollout(message);
+                return;
+            }
+            // Only the free run draws on Comet's budget. Anything else reporting it is misclassified, and cancelling
+            // the whole rollout over it would leave nothing to re-enable it: record it as the customer's credits.
+            reason = AgentInsightsJob.FailureReason.OUT_OF_CREDITS;
+        }
+        try {
+            jobService.markRunFailed(message.workspaceId(), message.projectId(), reason, throwable.getMessage());
+        } catch (Exception e) {
+            log.warn("Failed to record run failure for reportId='{}', project='{}'",
+                    message.reportId(), message.projectId(), e);
+        }
+    }
+
+    // Comet's free-run budget is spent: cancel the rollout for everyone still owed a run. Nothing re-enables it:
+    // resuming means re-enrolling the projects through the internal enrolment endpoint.
+    private void cancelAutoFirstRunRollout(AgentInsightsReportMessage message) {
+        try {
+            int cancelled = jobService.cancelAutoFirstRunRollout(message.workspaceId(), message.projectId());
+            log.warn("Free Agent Insights budget exhausted on reportId='{}', project='{}'; cancelled the "
+                    + "auto-first-run rollout for {} projects", message.reportId(), message.projectId(), cancelled);
+        } catch (Exception e) {
+            log.error("Failed to cancel the auto-first-run rollout after the free budget ran out", e);
+        }
+    }
+
+    private boolean isDisabled() {
+        if (!serviceToggles.isAgentInsightsActive()) {
+            log.info("Agent Insights is disabled, skipping report subscriber lifecycle operation");
+            return true;
+        }
+        return false;
+    }
+}

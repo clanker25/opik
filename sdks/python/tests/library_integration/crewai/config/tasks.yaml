@@ -1,0 +1,19 @@
+# src/latest_ai_development/config/tasks.yaml
+research_task:
+  description: >
+    Conduct a research about {topic}
+    Make sure you find any interesting and relevant information given
+    the current year is 2024.
+  expected_output: >
+    A single bullet point with the most relevant information about {topic}
+  agent: researcher
+
+reporting_task:
+  description: >
+    Review the context you got and summarize it in one sentence for a report.
+#    Make sure the report is detailed and contains any and all relevant information.
+  expected_output: >
+    A one-sentence report summarizing the main topic.
+    Formatted as markdown without '```'
+  agent: reporting_analyst
+  output_file: report.md

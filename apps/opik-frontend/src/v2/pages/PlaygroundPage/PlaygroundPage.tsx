@@ -1,0 +1,348 @@
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+
+import { Separator } from "@/ui/separator";
+import { Skeleton } from "@/ui/skeleton";
+import PlaygroundOutputs from "@/v2/pages/PlaygroundPage/PlaygroundOutputs/PlaygroundOutputs";
+import PlaygroundScrollContainer from "@/v2/pages/PlaygroundPage/PlaygroundScrollContainer";
+import PlaygroundAddVariant from "@/v2/pages/PlaygroundPage/PlaygroundAddVariant";
+import { usePlaygroundDataset } from "@/hooks/usePlaygroundDataset";
+import useAppStore, { useActiveProjectId } from "@/store/AppStore";
+import useProjectById from "@/api/projects/useProjectById";
+import useProviderKeys from "@/api/provider-keys/useProviderKeys";
+import PlaygroundPrompts from "@/v2/pages/PlaygroundPage/PlaygroundPrompts/PlaygroundPrompts";
+import PlaygroundHeader from "@/v2/pages/PlaygroundPage/PlaygroundHeader";
+import PlaygroundErrorBoundary from "@/v2/pages/PlaygroundPage/PlaygroundErrorBoundary";
+import SetupProviderDialog from "@/v2/pages-shared/llm/SetupProviderDialog/SetupProviderDialog";
+import useActionButtonActions from "@/v2/pages/PlaygroundPage/useActionButtonActions";
+import useDatasetById from "@/api/datasets/useDatasetById";
+import {
+  useTriggerProviderValidation,
+  useIsRunning,
+  usePromptCount,
+  useSetPromptMap,
+  useClearCreatedExperiments,
+  useLastActiveProjectId,
+  useSetLastActiveProjectId,
+} from "@/store/PlaygroundStore";
+import { COMPOSED_PROVIDER_TYPE } from "@/types/providers";
+import { parseDatasetVersionKey } from "@/utils/datasetVersionStorage";
+import { usePermissions } from "@/contexts/PermissionsContext";
+import useNavigationBlocker from "@/hooks/useNavigationBlocker";
+import useLastPickedModel from "@/hooks/useLastPickedModel";
+import useLLMProviderModelsData from "@/hooks/useLLMProviderModelsData";
+import { generateDefaultPrompt } from "@/lib/playground";
+import useResetPlaygroundSession from "@/v2/pages-shared/playground/useResetPlaygroundSession";
+import { PLAYGROUND_LAST_PICKED_MODEL } from "@/constants/llm";
+
+const renderPlaygroundLoadingSkeleton = () => (
+  <div className="flex min-h-0 flex-1">
+    <div className="flex flex-1 flex-col">
+      <div className="flex h-10 shrink-0 items-center gap-2 border-b border-r bg-soft-background px-4">
+        <Skeleton className="h-4 w-[85px]" />
+        <Skeleton className="h-4 w-[69px]" />
+      </div>
+      <div className="flex h-[calc(50vh-40px)] shrink-0 flex-col gap-2 border-b border-r bg-soft-background p-4">
+        <Skeleton className="h-[116px] w-full" />
+        <Skeleton className="h-[62px] w-full" />
+        <Skeleton className="h-4 w-[84px]" />
+      </div>
+      <div className="flex flex-1 flex-col border-r bg-background p-4">
+        <Skeleton className="h-[213px] w-full" />
+      </div>
+    </div>
+    <div className="flex w-[var(--add-variant-width)] shrink-0 flex-col items-center gap-2 pt-[170px]">
+      <Skeleton className="size-7 rounded-md" />
+      <Skeleton className="h-4 w-[66px]" />
+    </div>
+  </div>
+);
+
+const PlaygroundPage = () => {
+  const workspaceName = useAppStore((state) => state.activeWorkspaceName);
+  const activeProjectId = useActiveProjectId();
+  const { data: activeProject } = useProjectById(
+    { projectId: activeProjectId! },
+    { enabled: !!activeProjectId },
+  );
+  const {
+    permissions: { canViewDatasets, canCreateExperiments },
+  } = usePermissions();
+  const [setupDialogOpen, setSetupDialogOpen] = useState(false);
+  const [hasCheckedInitialProviders, setHasCheckedInitialProviders] =
+    useState(false);
+  const triggerProviderValidation = useTriggerProviderValidation();
+  const isRunning = useIsRunning();
+  const promptCount = usePromptCount();
+
+  const { datasetId, versionName, versionHash, itemsTotal, setDatasetId } =
+    usePlaygroundDataset();
+
+  const setPromptMap = useSetPromptMap();
+  const clearCreatedExperiments = useClearCreatedExperiments();
+  const resetPlaygroundSession = useResetPlaygroundSession();
+  const lastActiveProjectId = useLastActiveProjectId();
+  const setLastActiveProjectId = useSetLastActiveProjectId();
+
+  const {
+    data: providerKeysData,
+    isPending: isPendingProviderKeys,
+    isFetched: isFetchedProviderKeys,
+  } = useProviderKeys({ workspaceName });
+
+  const providerKeys: COMPOSED_PROVIDER_TYPE[] = useMemo(() => {
+    return providerKeysData?.content?.map((c) => c.ui_composed_provider) || [];
+  }, [providerKeysData]);
+  const hasLoadedProviderKeys = !!providerKeysData;
+
+  const [lastPickedModel] = useLastPickedModel({
+    key: PLAYGROUND_LAST_PICKED_MODEL,
+  });
+  const {
+    calculateModelProvider,
+    calculateDefaultModel,
+    isDropdownModel,
+    isFetched: isFetchedModels,
+  } = useLLMProviderModelsData();
+
+  // Prompts created or validated before the model registry lands get an empty provider, so the
+  // prompts mount only once the keys and the registry have each answered. isFetched, not !isPending:
+  // a query that failed without data goes back to pending whenever a new observer mounts, and the
+  // prompts mount observers of both, so an isPending gate unmounts them and refetches in a loop.
+  const isPendingPlaygroundSetup = !isFetchedProviderKeys || !isFetchedModels;
+
+  const resetPrompts = useCallback(() => {
+    if (isPendingPlaygroundSetup) {
+      setPromptMap([], {});
+      return;
+    }
+
+    const prompt = generateDefaultPrompt({
+      setupProviders: providerKeys,
+      lastPickedModel,
+      providerResolver: calculateModelProvider,
+      modelResolver: calculateDefaultModel,
+      isDropdownModel,
+    });
+    setPromptMap([prompt.id], { [prompt.id]: prompt });
+  }, [
+    isPendingPlaygroundSetup,
+    providerKeys,
+    lastPickedModel,
+    calculateModelProvider,
+    calculateDefaultModel,
+    isDropdownModel,
+    setPromptMap,
+  ]);
+
+  const resetPlayground = useCallback(() => {
+    resetPrompts();
+    resetPlaygroundSession();
+  }, [resetPrompts, resetPlaygroundSession]);
+
+  useEffect(() => {
+    if (lastActiveProjectId != activeProjectId) {
+      setLastActiveProjectId(activeProjectId);
+      resetPlayground();
+    }
+  }, [
+    lastActiveProjectId,
+    activeProjectId,
+    setLastActiveProjectId,
+    resetPlayground,
+  ]);
+
+  const prevDatasetIdRef = useRef(datasetId);
+  useEffect(() => {
+    if (
+      prevDatasetIdRef.current !== null &&
+      prevDatasetIdRef.current !== datasetId
+    ) {
+      clearCreatedExperiments();
+    }
+    prevDatasetIdRef.current = datasetId;
+  }, [datasetId, clearCreatedExperiments]);
+
+  const { DialogComponent } = useNavigationBlocker({
+    condition: isRunning && !datasetId,
+    title: "Prompt execution in progress",
+    description:
+      "Your prompt is currently running. Leaving now will interrupt the execution and may result in incomplete traces. Are you sure you want to leave?",
+    confirmText: "Leave anyway",
+    cancelText: "Stay and wait",
+  });
+
+  // Auto-open setup dialog when no providers configured (only on initial load)
+  useEffect(() => {
+    if (hasLoadedProviderKeys && !hasCheckedInitialProviders) {
+      setHasCheckedInitialProviders(true);
+      if (providerKeys.length === 0) {
+        setSetupDialogOpen(true);
+      }
+    }
+  }, [hasLoadedProviderKeys, hasCheckedInitialProviders, providerKeys.length]);
+
+  // Handle provider addition - trigger validation for all prompts
+  const handleProviderAdded = useCallback(() => {
+    triggerProviderValidation();
+  }, [triggerProviderValidation]);
+
+  const parsed = useMemo(() => parseDatasetVersionKey(datasetId), [datasetId]);
+  const plainDatasetId = parsed?.datasetId || datasetId;
+  const parsedVersionId = parsed?.versionId;
+
+  const { data: selectedDataset } = useDatasetById(
+    { datasetId: plainDatasetId! },
+    { enabled: canViewDatasets && !!plainDatasetId },
+  );
+  const datasetName = selectedDataset?.name || null;
+
+  const isExperimentMode =
+    !!datasetId && canViewDatasets && canCreateExperiments;
+  const experimentDatasetId = isExperimentMode ? datasetId : null;
+
+  const { runAll, stopAll, stopWatching, runSingle, stopSingle, checkAgain } =
+    useActionButtonActions({
+      workspaceName,
+      datasetName,
+      datasetVersionId: parsedVersionId || undefined,
+      datasetId: (isExperimentMode && plainDatasetId) || undefined,
+      versionHash: versionHash || undefined,
+      projectName: activeProject?.name,
+      projectId: activeProjectId,
+    });
+
+  // Through a ref, with no dependencies: this must run when the page goes away and at no other
+  // time. Depending on the callback re-runs the cleanup whenever its identity changes — which it
+  // does once the dataset id resolves — tearing down a run that is still going.
+  const stopWatchingRef = useRef(stopWatching);
+  stopWatchingRef.current = stopWatching;
+  useEffect(() => {
+    return () => stopWatchingRef.current();
+  }, []);
+
+  const headerMaxWidth = isPendingPlaygroundSetup
+    ? undefined
+    : `calc(${promptCount} * var(--max-prompt-width) + var(--add-variant-width))`;
+
+  return (
+    <PlaygroundScrollContainer
+      className="-mx-6 h-full overflow-y-auto overflow-x-hidden"
+      style={
+        {
+          "--min-prompt-width": "400px",
+          "--max-prompt-width": "1440px",
+          "--add-variant-width": "90px",
+        } as React.CSSProperties
+      }
+    >
+      <div className="flex min-h-full min-w-full flex-col bg-background">
+        <div className="bg-gray-100">
+          <PlaygroundHeader
+            workspaceName={workspaceName}
+            datasetId={experimentDatasetId}
+            datasetName={datasetName}
+            versionName={versionName}
+            versionItemsTotal={itemsTotal}
+            onChangeDatasetId={setDatasetId}
+            onReset={resetPlayground}
+            onRunAll={runAll}
+            onRunSingle={runSingle}
+            onStopAll={stopAll}
+            maxWidth={headerMaxWidth}
+          />
+        </div>
+
+        <Separator />
+
+        {isPendingPlaygroundSetup ? (
+          renderPlaygroundLoadingSkeleton()
+        ) : isExperimentMode ? (
+          <>
+            <div className="flex h-[50vh] shrink-0 overflow-x-auto">
+              <div
+                className="flex flex-1 shrink-0 bg-soft-background"
+                style={{
+                  minWidth: `calc(${promptCount} * var(--min-prompt-width))`,
+                  maxWidth: `calc(${promptCount} * var(--max-prompt-width))`,
+                }}
+              >
+                <PlaygroundPrompts
+                  workspaceName={workspaceName}
+                  providerKeys={providerKeys}
+                  isPendingProviderKeys={isPendingProviderKeys}
+                  hasLoadedProviderKeys={hasLoadedProviderKeys}
+                  runSingle={runSingle}
+                  stopSingle={stopSingle}
+                  checkAgain={checkAgain}
+                />
+              </div>
+
+              <PlaygroundAddVariant providerKeys={providerKeys} />
+            </div>
+
+            <PlaygroundOutputs
+              datasetId={experimentDatasetId}
+              versionHash={versionHash}
+              runSingle={runSingle}
+              stopSingle={stopSingle}
+              checkAgain={checkAgain}
+            />
+          </>
+        ) : (
+          <div className="flex min-h-0 flex-1 overflow-x-auto">
+            <div
+              className="flex flex-1 shrink-0 flex-col"
+              style={{
+                minWidth: `calc(${promptCount} * var(--min-prompt-width))`,
+                maxWidth: `calc(${promptCount} * var(--max-prompt-width))`,
+              }}
+            >
+              <div className="flex h-[50vh] shrink-0 bg-soft-background">
+                <PlaygroundPrompts
+                  workspaceName={workspaceName}
+                  providerKeys={providerKeys}
+                  isPendingProviderKeys={isPendingProviderKeys}
+                  hasLoadedProviderKeys={hasLoadedProviderKeys}
+                />
+              </div>
+
+              <div className="flex flex-1">
+                <PlaygroundOutputs
+                  datasetId={experimentDatasetId}
+                  versionHash={versionHash}
+                  runSingle={runSingle}
+                  stopSingle={stopSingle}
+                  checkAgain={checkAgain}
+                />
+              </div>
+            </div>
+
+            <PlaygroundAddVariant providerKeys={providerKeys} />
+          </div>
+        )}
+      </div>
+
+      <SetupProviderDialog
+        open={setupDialogOpen}
+        setOpen={setSetupDialogOpen}
+        onProviderAdded={handleProviderAdded}
+      />
+
+      {DialogComponent}
+    </PlaygroundScrollContainer>
+  );
+};
+
+const PlaygroundPageWithRecovery = () => (
+  <PlaygroundErrorBoundary>
+    <PlaygroundPage />
+  </PlaygroundErrorBoundary>
+);
+
+export default PlaygroundPageWithRecovery;

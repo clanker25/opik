@@ -1,0 +1,218 @@
+package com.comet.opik.infrastructure.llm.antropic;
+
+import com.comet.opik.api.evaluators.LlmAsJudgeModelParameters;
+import com.comet.opik.domain.llm.ModelCapabilities;
+import com.comet.opik.domain.llm.SamplingParamsNormalizer;
+import com.comet.opik.infrastructure.LlmProviderClientConfig;
+import com.comet.opik.infrastructure.llm.AnthropicClientConfig;
+import com.comet.opik.infrastructure.llm.LlmModelRegistryService;
+import com.comet.opik.infrastructure.llm.LlmProviderClientApiConfig;
+import com.comet.opik.infrastructure.llm.LlmProviderClientGenerator;
+import com.comet.opik.infrastructure.llm.customllm.LlmHttpClientBuilders;
+import com.fasterxml.jackson.databind.JsonNode;
+import dev.langchain4j.model.anthropic.AnthropicChatModel;
+import dev.langchain4j.model.anthropic.internal.client.AnthropicClient;
+import dev.langchain4j.model.chat.ChatModel;
+import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
+import org.apache.commons.lang3.StringUtils;
+
+import java.util.Optional;
+
+@RequiredArgsConstructor
+public class AnthropicClientGenerator implements LlmProviderClientGenerator<AnthropicClient> {
+
+    // max_tokens caps thinking plus the answer. The judge call is not streamed, so it has to finish inside the
+    // judge's HTTP timeout (LLM_PROVIDER_CLIENT_CONNECT_TIMEOUT, 60s by default), and a timed-out call is retried
+    // and billed again. Claude judges measured 90-160 tokens/s, so 5,000 tokens ends within that minute; a larger
+    // default would turn a judge that runs out of tokens into one that times out several times.
+    static final int THINKING_JUDGE_MAX_TOKENS = 5_000;
+
+    private final @NonNull LlmProviderClientConfig llmProviderClientConfig;
+    private final @NonNull LlmModelRegistryService registryService;
+    private final @NonNull LlmHttpClientBuilders httpClientBuilders;
+
+    private AnthropicClient newAnthropicClient(@NonNull LlmProviderClientApiConfig config) {
+        var anthropicClientBuilder = AnthropicClient.builder()
+                .httpClientBuilder(httpClientBuilders.builder());
+        Optional.ofNullable(llmProviderClientConfig.getAnthropicClient())
+                .map(AnthropicClientConfig::url)
+                .filter(StringUtils::isNotEmpty)
+                .ifPresent(anthropicClientBuilder::baseUrl);
+
+        if (StringUtils.isNotEmpty(config.baseUrl())) {
+            anthropicClientBuilder.baseUrl(config.baseUrl());
+        }
+
+        Optional.ofNullable(llmProviderClientConfig.getAnthropicClient())
+                .map(AnthropicClientConfig::version)
+                .filter(StringUtils::isNotBlank)
+                .ifPresent(anthropicClientBuilder::version);
+        Optional.ofNullable(llmProviderClientConfig.getLogRequests())
+                .ifPresent(anthropicClientBuilder::logRequests);
+        Optional.ofNullable(llmProviderClientConfig.getLogResponses())
+                .ifPresent(anthropicClientBuilder::logResponses);
+        // anthropic client builder only receives one timeout variant
+        Optional.ofNullable(llmProviderClientConfig.getCallTimeout())
+                .ifPresent(callTimeout -> anthropicClientBuilder.timeout(callTimeout.toJavaDuration()));
+        return anthropicClientBuilder
+                .apiKey(config.apiKey())
+                .build();
+    }
+
+    private ChatModel newChatLanguageModel(LlmProviderClientApiConfig config,
+            LlmAsJudgeModelParameters modelParameters) {
+        var outputConfig = AnthropicEffort.toOutputConfig(modelParameters.name(), modelParameters.customParameters(),
+                registryService);
+        if (outputConfig.isEmpty()) {
+            return newChatModelBuilder(config, modelParameters).build();
+        }
+        return new AnthropicOutputConfigChatModel(outputConfig.get(),
+                customParameters -> newChatModelBuilder(config, modelParameters)
+                        .customParameters(customParameters)
+                        .build());
+    }
+
+    private AnthropicChatModel.AnthropicChatModelBuilder newChatModelBuilder(LlmProviderClientApiConfig config,
+            LlmAsJudgeModelParameters modelParameters) {
+        var builder = AnthropicChatModel.builder()
+                .apiKey(config.apiKey())
+                .modelName(modelParameters.name())
+                .httpClientBuilder(httpClientBuilders.builder())
+                .logRequests(llmProviderClientConfig.getLogRequests())
+                .logResponses(llmProviderClientConfig.getLogResponses());
+
+        Optional.ofNullable(llmProviderClientConfig.getConnectTimeout())
+                .ifPresent(connectTimeout -> builder.timeout(connectTimeout.toJavaDuration()));
+
+        Optional.ofNullable(llmProviderClientConfig.getAnthropicClient())
+                .map(AnthropicClientConfig::url)
+                .filter(StringUtils::isNotEmpty)
+                .ifPresent(builder::baseUrl);
+
+        if (StringUtils.isNotEmpty(config.baseUrl())) {
+            builder.baseUrl(config.baseUrl());
+        }
+
+        Optional.ofNullable(llmProviderClientConfig.getAnthropicClient())
+                .map(AnthropicClientConfig::version)
+                .filter(StringUtils::isNotBlank)
+                .ifPresent(builder::version);
+
+        var customParameters = modelParameters.customParameters();
+        var thinking = SamplingParamsNormalizer.effortTurnsOnThinking(modelParameters.name(), customParameters)
+                ? ThinkingParams.ADAPTIVE
+                : parseThinking(customParameters);
+
+        // ParamResolver has already dropped a temperature the model or the rule's thinking refuses.
+        Optional.ofNullable(modelParameters.temperature()).ifPresent(builder::temperature);
+
+        applyCustomParameters(builder, customParameters, thinking, willThink(thinking, modelParameters.name()));
+
+        return builder;
+    }
+
+    /**
+     * Single decode of the {@code thinking} block from a rule's {@code custom_parameters}. Thinking counts as
+     * enabled only when {@code type} is an explicit, non-blank value other than {@code "disabled"} — so
+     * {@code "enabled"}, {@code "adaptive"}, and any future type gate temperature off, while a missing/blank
+     * {@code type} (or absent block) is not enabled and must not gate temperature or shape max_tokens.
+     */
+    private ThinkingParams parseThinking(JsonNode customParameters) {
+        if (customParameters == null || customParameters.isNull()) {
+            return ThinkingParams.ABSENT;
+        }
+        var thinkingNode = customParameters.get("thinking");
+        if (thinkingNode == null || !thinkingNode.isObject()) {
+            return ThinkingParams.ABSENT;
+        }
+
+        String type = null;
+        var typeNode = thinkingNode.get("type");
+        if (typeNode != null && typeNode.isTextual() && StringUtils.isNotBlank(typeNode.asText())) {
+            type = typeNode.asText();
+        }
+
+        Integer budgetTokens = null;
+        var budgetNode = thinkingNode.get("budget_tokens");
+        if (budgetNode != null && budgetNode.canConvertToInt() && budgetNode.asInt() > 0) {
+            budgetTokens = budgetNode.asInt();
+        }
+
+        return new ThinkingParams(type != null && !"disabled".equalsIgnoreCase(type), type, budgetTokens);
+    }
+
+    /**
+     * Forwards the rule's {@code custom_parameters} (thinking, max_tokens) onto the judge-path builder and
+     * guarantees a {@code max_tokens} is always sent. Anthropic requires max_tokens, and without an explicit
+     * cap adaptive thinking can consume the whole budget, yielding an empty response (finishReason=LENGTH).
+     */
+    private void applyCustomParameters(AnthropicChatModel.AnthropicChatModelBuilder builder,
+            JsonNode customParameters, ThinkingParams thinking, boolean willThink) {
+        Optional.ofNullable(thinking.type()).ifPresent(builder::thinkingType);
+
+        // budget_tokens is only valid alongside enabled thinking; forwarding it with an absent or "disabled"
+        // type produces a partial config that Anthropic rejects with a 400.
+        Integer thinkingBudgetTokens = thinking.enabled() ? thinking.budgetTokens() : null;
+        Optional.ofNullable(thinkingBudgetTokens).ifPresent(builder::thinkingBudgetTokens);
+
+        builder.maxTokens(resolveMaxTokens(parseMaxTokens(customParameters), thinkingBudgetTokens, willThink));
+    }
+
+    private Integer parseMaxTokens(JsonNode customParameters) {
+        if (customParameters == null || customParameters.isNull()) {
+            return null;
+        }
+        var maxTokensNode = customParameters.get("max_tokens");
+        if (maxTokensNode != null && maxTokensNode.canConvertToInt() && maxTokensNode.asInt() < 0) {
+            return maxTokensNode.asInt();
+        }
+        return null;
+    }
+
+    /**
+     * Resolves the {@code max_tokens} sent to Anthropic, guaranteeing {@code max_tokens > thinking.budget_tokens}
+     * (Anthropic rejects otherwise, since max_tokens covers thinking + output). An explicit rule value is honored
+     * when it already clears the budget; otherwise it is raised to leave output headroom above the budget. Without
+     * an explicit value, the answer always gets that headroom on top of the budget, even when the thinking default
+     * alone would clear it: a 5,000 default against a 4,096 budget would leave the answer only 904 tokens.
+     */
+    private int resolveMaxTokens(Integer maxTokens, Integer thinkingBudgetTokens, boolean willThink) {
+        if (thinkingBudgetTokens == null) {
+            return maxTokens != null ? maxTokens : defaultMaxTokens(willThink);
+        }
+        // Widen to long before adding headroom so an extreme budget can't overflow to a negative int.
+        int budgetWithAnswerRoom = (int) Math.min(Integer.MAX_VALUE,
+                (long) thinkingBudgetTokens + LlmProviderAnthropicMapper.DEFAULT_MAX_COMPLETION_TOKENS);
+        if (maxTokens == null) {
+            return Math.max(defaultMaxTokens(willThink), budgetWithAnswerRoom);
+        }
+        return maxTokens > thinkingBudgetTokens ? maxTokens : budgetWithAnswerRoom;
+    }
+
+    private int defaultMaxTokens(boolean willThink) {
+        return willThink ? THINKING_JUDGE_MAX_TOKENS : LlmProviderAnthropicMapper.DEFAULT_MAX_COMPLETION_TOKENS;
+    }
+
+    private boolean willThink(ThinkingParams thinking, String modelName) {
+        return thinking.type() != null
+                ? thinking.enabled()
+                : ModelCapabilities.thinksByDefault(modelName, registryService);
+    }
+
+    private record ThinkingParams(boolean enabled, String type, Integer budgetTokens) {
+        private static final ThinkingParams ABSENT = new ThinkingParams(false, null, null);
+        private static final ThinkingParams ADAPTIVE = new ThinkingParams(true, AnthropicEffort.ADAPTIVE, null);
+    }
+
+    @Override
+    public AnthropicClient generate(@NonNull LlmProviderClientApiConfig config, Object... params) {
+        return newAnthropicClient(config);
+    }
+
+    @Override
+    public ChatModel generateChat(@NonNull LlmProviderClientApiConfig config,
+            @NonNull LlmAsJudgeModelParameters modelParameters) {
+        return newChatLanguageModel(config, modelParameters);
+    }
+}

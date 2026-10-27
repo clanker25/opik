@@ -1,0 +1,101 @@
+package com.comet.opik.infrastructure;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotNull;
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.With;
+
+@Data
+@NoArgsConstructor
+// Only for @With; kept from Jackson so config.yml keeps binding through the no-args constructor and its defaults.
+@AllArgsConstructor(access = AccessLevel.PRIVATE, onConstructor_ = @JsonCreator(mode = JsonCreator.Mode.DISABLED))
+public class ServiceTogglesConfig {
+
+    @Valid @JsonProperty
+    @NotNull boolean pythonEvaluatorEnabled;
+    @JsonProperty
+    @NotNull boolean traceThreadPythonEvaluatorEnabled;
+    @JsonProperty
+    @NotNull boolean spanLlmAsJudgeEnabled;
+    @JsonProperty
+    @NotNull boolean spanUserDefinedMetricPythonEnabled;
+    @JsonProperty
+    @NotNull boolean guardrailsEnabled;
+    @JsonProperty
+    @NotNull boolean opikAIEnabled;
+    @JsonProperty
+    @NotNull boolean alertsEnabled;
+    @JsonProperty
+    @NotNull boolean welcomeWizardEnabled;
+    @JsonProperty
+    @NotNull boolean exportEnabled;
+    @JsonProperty
+    @NotNull boolean costIntelligenceEnabled;
+    @JsonProperty
+    @NotNull boolean datasetVersioningEnabled;
+    @JsonProperty
+    @NotNull boolean datasetExportEnabled;
+    @JsonProperty
+    @NotNull boolean demoDataEnabled;
+    // LLM Provider feature flags
+    @JsonProperty
+    @NotNull boolean openaiProviderEnabled;
+    @JsonProperty
+    @NotNull boolean anthropicProviderEnabled;
+    @JsonProperty
+    @NotNull boolean geminiProviderEnabled;
+    @JsonProperty
+    @NotNull boolean openrouterProviderEnabled;
+    @JsonProperty
+    @NotNull boolean vertexaiProviderEnabled;
+    @JsonProperty
+    @NotNull boolean bedrockProviderEnabled;
+    @JsonProperty
+    @NotNull boolean customllmProviderEnabled;
+    @JsonProperty
+    @NotNull boolean ollamaProviderEnabled;
+    @JsonProperty
+    @NotNull boolean ollieEnabled;
+    // Defaults on so a config that omits the key keeps Agent Insights as it was before this toggle existed.
+    @JsonProperty
+    @NotNull boolean agentInsightsEnabled = true;
+    @JsonProperty
+    @NotNull boolean agentInsightsGuidanceEnabled;
+    @JsonProperty
+    @NotNull boolean projectHomepageEnabled;
+    @JsonProperty
+    @NotNull boolean onlineScoringTracingEnabled;
+    @JsonProperty
+    @NotNull boolean annotationQueueAutomationEnabled;
+    @JsonProperty
+    @NotNull boolean eventBridgeAlertsEnabled;
+
+    @JsonProperty
+    @Min(5) @Max(100) int defaultPageSize;
+
+    // Set per request by the toggles endpoint, never from config. No getter: the shared instance always holds false,
+    // so the code checks CustomChartsConfig.isEnabled instead.
+    @JsonProperty(access = JsonProperty.Access.READ_ONLY)
+    @With
+    @Getter(AccessLevel.NONE)
+    boolean customChartsEnabledForWorkspace;
+
+    @JsonIgnore
+    public boolean isAgentInsightsActive() {
+        return ollieEnabled && agentInsightsEnabled;
+    }
+
+    @JsonIgnore
+    public boolean isAgentInsightsGuidanceActive() {
+        return isAgentInsightsActive() && agentInsightsGuidanceEnabled;
+    }
+}

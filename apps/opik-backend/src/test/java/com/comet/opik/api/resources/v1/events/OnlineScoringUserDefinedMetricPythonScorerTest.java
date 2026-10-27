@@ -1,0 +1,519 @@
+package com.comet.opik.api.resources.v1.events;
+
+import com.comet.opik.api.ScoreSource;
+import com.comet.opik.api.Trace;
+import com.comet.opik.api.events.TraceToScoreUserDefinedMetricPython;
+import com.comet.opik.domain.FeedbackScoreService;
+import com.comet.opik.domain.SpanService;
+import com.comet.opik.domain.TraceService;
+import com.comet.opik.domain.evaluators.python.PythonEvaluatorService;
+import com.comet.opik.domain.evaluators.python.PythonScoreResult;
+import com.comet.opik.infrastructure.OnlineScoringConfig;
+import com.comet.opik.infrastructure.ServiceTogglesConfig;
+import com.comet.opik.infrastructure.log.UserFacingLoggingFactory;
+import com.comet.opik.podam.PodamFactoryUtils;
+import com.comet.opik.utils.JsonUtils;
+import io.dropwizard.util.Duration;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.MockedStatic;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.redisson.api.RStreamReactive;
+import org.redisson.api.RedissonReactiveClient;
+import org.redisson.api.options.PlainOptions;
+import org.slf4j.Logger;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import uk.co.jemos.podam.api.PodamFactory;
+
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static com.comet.opik.api.FeedbackScoreItem.FeedbackScoreBatchItem;
+import static com.comet.opik.api.evaluators.AutomationRuleEvaluatorUserDefinedMetricPython.UserDefinedMetricPythonCode;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.contains;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.mockingDetails;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+class OnlineScoringUserDefinedMetricPythonScorerTest {
+
+    // Restated independently and byte-identical to the span scorer's copy: that is what makes one search
+    // catch both scorers, so a divergence between them fails here rather than passing quietly.
+    private static final String UNRESOLVED_ARGUMENTS_LOG = "None of the metric's declared arguments resolved,"
+            + " so there is no data to evaluate. Check the declared paths against the input, output and"
+            + " metadata present on the entity. {} '{}', rule '{}', unresolved arguments: {}";
+
+    private static final String EVALUATING_LOG = "Evaluating {} '{}' sampled by rule '{}'";
+    private static final String SENDING_LOG = "Sending {} '{}' to Python evaluator: '{}'";
+
+    private final PodamFactory podamFactory = PodamFactoryUtils.newPodamFactory();
+
+    @Mock
+    private OnlineScoringConfig onlineScoringConfig;
+    @Mock
+    private ServiceTogglesConfig serviceTogglesConfig;
+    @Mock
+    private RedissonReactiveClient redissonClient;
+    @Mock
+    private FeedbackScoreService feedbackScoreService;
+    @Mock
+    private TraceService traceService;
+    @Mock
+    private SpanService spanService;
+    @Mock
+    private PythonEvaluatorService pythonEvaluatorService;
+
+    private OnlineScoringUserDefinedMetricPythonScorer scorer;
+    private MockedStatic<UserFacingLoggingFactory> mockedFactory;
+    private Logger userFacingLogger;
+
+    private UUID projectId;
+    private UUID traceId;
+    private UUID ruleId;
+    private String workspaceId;
+    private String userName;
+    private String ruleName;
+
+    @BeforeEach
+    void setUp() {
+        userFacingLogger = mock(Logger.class);
+        mockedFactory = mockStatic(UserFacingLoggingFactory.class);
+        mockedFactory.when(() -> UserFacingLoggingFactory.getLogger(any(Class.class)))
+                .thenReturn(userFacingLogger);
+
+        var streamConfig = OnlineScoringConfig.StreamConfiguration.builder()
+                .scorer("user_defined_metric_python")
+                .streamName("stream_scoring_user_defined_metric_python")
+                .codec("java")
+                .poolingInterval(Duration.milliseconds(500))
+                .longPollingDuration(Duration.seconds(5))
+                .consumerBatchSize(10)
+                .claimIntervalRatio(10)
+                .pendingMessageDuration(Duration.minutes(10))
+                .maxRetries(3)
+                .build();
+
+        when(onlineScoringConfig.getStreams()).thenReturn(List.of(streamConfig));
+        when(onlineScoringConfig.getConsumerGroupName()).thenReturn("online_scoring");
+
+        scorer = new OnlineScoringUserDefinedMetricPythonScorer(
+                onlineScoringConfig,
+                serviceTogglesConfig,
+                redissonClient,
+                feedbackScoreService,
+                traceService,
+                spanService,
+                pythonEvaluatorService);
+
+        projectId = UUID.randomUUID();
+        traceId = UUID.randomUUID();
+        ruleId = UUID.randomUUID();
+        workspaceId = "workspace-" + RandomStringUtils.secure().nextAlphanumeric(32);
+        userName = "user-" + RandomStringUtils.secure().nextAlphanumeric(32);
+        ruleName = "rule-" + RandomStringUtils.secure().nextAlphanumeric(32);
+    }
+
+    @AfterEach
+    void tearDown() {
+        if (mockedFactory != null) {
+            mockedFactory.close();
+        }
+    }
+
+    @Nested
+    class ServiceToggleTests {
+
+        @Test
+        void startsConsumerWhenToggleIsEnabled() {
+            when(serviceTogglesConfig.isPythonEvaluatorEnabled()).thenReturn(true);
+            RStreamReactive<Object, Object> stream = mock(RStreamReactive.class);
+            when(redissonClient.getStream(any(PlainOptions.class))).thenReturn(stream);
+            when(stream.createGroup(any())).thenReturn(Mono.empty());
+
+            scorer.start();
+        }
+
+        @Test
+        void skipsStartWhenToggleIsDisabled() {
+            when(serviceTogglesConfig.isPythonEvaluatorEnabled()).thenReturn(false);
+
+            scorer.start();
+
+            verify(redissonClient, never()).getStream(any(PlainOptions.class));
+        }
+    }
+
+    @Nested
+    class ScoringTests {
+
+        @Test
+        void scoresTraceAndPersistsScores() {
+            var message = sampleMessage();
+            var pythonScore = PythonScoreResult.builder()
+                    .name("test_score")
+                    .value(BigDecimal.valueOf(0.95))
+                    .reason("test reason")
+                    .build();
+
+            when(pythonEvaluatorService.evaluate(eq(message.code().metric()), any()))
+                    .thenReturn(Mono.just(List.of(pythonScore)));
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
+            scorer.score(message).block();
+
+            var captor = ArgumentCaptor.forClass(List.class);
+            verify(feedbackScoreService).scoreBatchOfTraces(captor.capture());
+
+            assertThat(captor.getValue()).usingRecursiveComparison().isEqualTo(List.of(
+                    traceScore("test_score", BigDecimal.valueOf(0.95), "test reason", message.trace())));
+        }
+
+        @Test
+        void dropsScoresWithoutValueAndStoresTheRest() {
+            // A user metric may return ScoreResult(value=None) for a check that did not apply. That score
+            // cannot be stored, but it must not cost the rest of the batch: binding it used to throw an NPE
+            // that failed the whole insert, so a trace scored by several metrics stored none of them.
+            var message = sampleMessage();
+            var valued = PythonScoreResult.builder()
+                    .name("answer_relevance")
+                    .value(BigDecimal.valueOf(0.75))
+                    .reason("relevant")
+                    .build();
+            var valueless = PythonScoreResult.builder()
+                    .name("hallucination")
+                    .reason("metric could not decide")
+                    .build();
+
+            when(pythonEvaluatorService.evaluate(eq(message.code().metric()), any()))
+                    .thenReturn(Mono.just(List.of(valued, valueless)));
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
+            scorer.score(message).block();
+
+            var captor = ArgumentCaptor.forClass(List.class);
+            verify(feedbackScoreService).scoreBatchOfTraces(captor.capture());
+            assertThat(captor.getValue()).usingRecursiveComparison().isEqualTo(List.of(
+                    traceScore("answer_relevance", BigDecimal.valueOf(0.75), "relevant", message.trace())));
+        }
+
+        @Test
+        void dropsAScoreTheMetricFlaggedAsFailedBeforeStoring() {
+            // The SDK pairs scoring_failed with a placeholder 0.0, so such a score is storable and would be
+            // recorded as a genuine zero. The split classifies it; this pins that the scorer stores what the
+            // split kept, rather than the list it was handed.
+            var message = sampleMessage();
+            var valued = PythonScoreResult.builder()
+                    .name("answer_relevance")
+                    .value(BigDecimal.valueOf(0.75))
+                    .reason("relevant")
+                    .build();
+            var failed = PythonScoreResult.builder()
+                    .name("hallucination")
+                    .value(BigDecimal.ZERO)
+                    .scoringFailed(true)
+                    .reason("upstream call failed")
+                    .build();
+
+            when(pythonEvaluatorService.evaluate(eq(message.code().metric()), any()))
+                    .thenReturn(Mono.just(List.of(valued, failed)));
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
+            scorer.score(message).block();
+
+            var captor = ArgumentCaptor.forClass(List.class);
+            verify(feedbackScoreService).scoreBatchOfTraces(captor.capture());
+            assertThat(captor.getValue()).usingRecursiveComparison().isEqualTo(List.of(
+                    traceScore("answer_relevance", BigDecimal.valueOf(0.75), "relevant", message.trace())));
+        }
+
+        @Test
+        void reportsTheDroppedScoreOnTheRuleLog() {
+            var message = sampleMessage();
+            var valueless = PythonScoreResult.builder().name("hallucination").build();
+
+            when(pythonEvaluatorService.evaluate(eq(message.code().metric()), any()))
+                    .thenReturn(Mono.just(List.of(valueless)));
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
+            scorer.score(message).block();
+
+            verify(userFacingLogger).warn(
+                    contains("because the metric returned no value"),
+                    eq("'hallucination'"),
+                    eq("traceId"),
+                    eq(traceId.toString()));
+        }
+
+        @Test
+        void storesNothingAndDoesNotFailWhenEveryScoreIsValueless() {
+            var message = sampleMessage();
+
+            when(pythonEvaluatorService.evaluate(eq(message.code().metric()), any()))
+                    .thenReturn(Mono.just(List.of(
+                            PythonScoreResult.builder().name("first").build(),
+                            PythonScoreResult.builder().name("second").build())));
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
+            scorer.score(message).block();
+
+            var captor = ArgumentCaptor.forClass(List.class);
+            verify(feedbackScoreService).scoreBatchOfTraces(captor.capture());
+            assertThat(captor.getValue()).isEmpty();
+        }
+
+        @Test
+        void skipsSpanFetchWhenSpansArgumentAbsent() {
+            // The sample metric maps only input/output; the `spans` opt-in key isn't present,
+            // so the scorer must not call out to the span service.
+            var message = sampleMessage();
+            when(pythonEvaluatorService.evaluate(eq(message.code().metric()), any()))
+                    .thenReturn(Mono.just(List.of()));
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
+            scorer.score(message).block();
+
+            verify(spanService, never()).getByTraceIds(any());
+
+            @SuppressWarnings("unchecked")
+            var dataCaptor = (ArgumentCaptor<Map<String, Object>>) (ArgumentCaptor<?>) ArgumentCaptor
+                    .forClass(Map.class);
+            verify(pythonEvaluatorService).evaluate(eq(message.code().metric()), dataCaptor.capture());
+            assertThat(dataCaptor.getValue()).doesNotContainKey("spans");
+        }
+
+        @Test
+        void fetchesSpansAndPassesThemAsListWhenSpansArgumentPresent() {
+            // User opts into spans by mapping the reserved `spans` key in their `arguments`.
+            // We verify (a) the span service is queried, and (b) the data handed to the Python
+            // evaluator carries spans as a typed List of the lean SpanForLlm projection — not
+            // raw Span, not a JSON string — so `json.loads` in the runner yields `spans` as a
+            // list of dicts with the projected shape (name/type/input/output/etc., plus nested
+            // children) in the metric's signature.
+            var message = sampleMessageWithSpansArgument();
+            // Build the span explicitly rather than via Podam so the projection assertion can
+            // reference a known `name` field — Podam fills random strings that obscure intent.
+            var span = com.comet.opik.api.Span.builder()
+                    .id(UUID.randomUUID())
+                    .traceId(traceId)
+                    .projectId(UUID.randomUUID())
+                    .name("fetch_weather")
+                    .type(com.comet.opik.domain.SpanType.tool)
+                    .startTime(java.time.Instant.now())
+                    .build();
+
+            when(spanService.getByTraceIds(eq(Set.of(traceId)))).thenReturn(Flux.just(span));
+            when(pythonEvaluatorService.evaluate(eq(message.code().metric()), any()))
+                    .thenReturn(Mono.just(List.of()));
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
+            scorer.score(message).block();
+
+            verify(spanService).getByTraceIds(eq(Set.of(traceId)));
+
+            @SuppressWarnings("unchecked")
+            var dataCaptor = (ArgumentCaptor<Map<String, Object>>) (ArgumentCaptor<?>) ArgumentCaptor
+                    .forClass(Map.class);
+            verify(pythonEvaluatorService).evaluate(eq(message.code().metric()), dataCaptor.capture());
+            var capturedSpans = dataCaptor.getValue().get("spans");
+            assertThat(capturedSpans).isInstanceOf(List.class);
+            assertThat((List<?>) capturedSpans).hasSize(1).first()
+                    .isInstanceOf(com.comet.opik.api.SpanForLlm.class)
+                    .extracting("name").isEqualTo("fetch_weather");
+        }
+
+        @Test
+        void reportsUnresolvedArgumentsOnTheRuleLogInsteadOfCallingTheEvaluator() {
+            // Declared fields the trace does not carry resolve to an empty map; the evaluator must not be
+            // called with it, and the user must be told which arguments to fix.
+            var message = sampleMessageWithUnresolvableArguments();
+
+            scorer.score(message).block();
+
+            verify(pythonEvaluatorService, never()).evaluate(any(), any());
+            verify(userFacingLogger).warn(
+                    eq(UNRESOLVED_ARGUMENTS_LOG),
+                    eq("traceId"),
+                    eq(traceId),
+                    eq(ruleName),
+                    eq("'expects_sql' -> 'input.expects_sql', 'plan' -> 'output.execution_plan'"));
+            verify(feedbackScoreService, never()).scoreBatchOfTraces(any());
+        }
+
+        @Test
+        void sanitisesAndCapsTheArgumentsItReports() {
+            // User-controlled text that persists in automation_rule_evaluator_logs.message: a newline must
+            // not forge an entry there, nor one long value flood it.
+            var longPath = "input." + RandomStringUtils.secure().nextAlphanumeric(200);
+            var message = sampleMessageWithArguments(Map.of(
+                    "a_newline", "input.first\nWARN forged entry",
+                    "b_long", longPath));
+
+            scorer.score(message).block();
+
+            var reported = ArgumentCaptor.forClass(String.class);
+            verify(userFacingLogger).warn(
+                    eq(UNRESOLVED_ARGUMENTS_LOG),
+                    eq("traceId"), eq(traceId), eq(ruleName), reported.capture());
+
+            // Whole string, not fragments, so separator, ordering, truncation and the absence of extras hold.
+            assertThat(reported.getValue()).isEqualTo(
+                    "'a_newline' -> 'input.first WARN forged entry', 'b_long' -> '%s…'"
+                            .formatted(longPath.substring(0, 100)));
+        }
+
+        @Test
+        void capsHowManyArgumentsItReports() {
+            // The count comes from the rule, so one rule would otherwise decide how much this path carries.
+            var arguments = IntStream.range(0, 13).boxed()
+                    .collect(Collectors.toMap("arg_%02d"::formatted, index -> "input.absent_%02d".formatted(index)));
+            var message = sampleMessageWithArguments(arguments);
+
+            scorer.score(message).block();
+
+            var reported = ArgumentCaptor.forClass(String.class);
+            verify(userFacingLogger).warn(
+                    eq(UNRESOLVED_ARGUMENTS_LOG),
+                    eq("traceId"), eq(traceId), eq(ruleName), reported.capture());
+
+            // Built independently so ordering, which ten survive the cap, and the omitted count are pinned.
+            var expected = IntStream.range(0, 10)
+                    .mapToObj(index -> "'arg_%02d' -> 'input.absent_%02d'".formatted(index, index))
+                    .collect(Collectors.joining(", ")) + " and 3 more";
+            assertThat(reported.getValue()).isEqualTo(expected);
+        }
+
+        @Test
+        void doesNotClaimItSentDataWhenNoDeclaredArgumentResolves() {
+            // Asserted as a sequence: checking only that the warning is present would still pass with the
+            // contradictory "Sending" line back. isInfoEnabled() must be stubbed true or a mock Logger
+            // suppresses that line by itself and the assertion holds with or without the fix; lenient()
+            // because the fixed path short-circuits before the level check.
+            lenient().when(userFacingLogger.isInfoEnabled()).thenReturn(true);
+            var message = sampleMessageWithUnresolvableArguments();
+
+            scorer.score(message).block();
+
+            assertThat(userFacingMessages()).containsExactly(EVALUATING_LOG, UNRESOLVED_ARGUMENTS_LOG);
+        }
+
+        @Test
+        void stillReportsSendingWhenThereIsDataToSend() {
+            // The suppression has to be conditional on emptiness, not unconditional — a run that really
+            // does send still has to say so, and still after the "Evaluating" line.
+            when(userFacingLogger.isInfoEnabled()).thenReturn(true);
+            var message = sampleMessage();
+            when(pythonEvaluatorService.evaluate(eq(message.code().metric()), any()))
+                    .thenReturn(Mono.just(List.of()));
+            when(feedbackScoreService.scoreBatchOfTraces(any())).thenReturn(Mono.empty());
+
+            scorer.score(message).block();
+
+            assertThat(userFacingMessages()).containsSubsequence(EVALUATING_LOG, SENDING_LOG);
+        }
+
+        @Test
+        void propagatesEvaluatorErrorAndLogsMessage() {
+            var message = sampleMessage();
+            var error = new RuntimeException("Python BE timeout");
+
+            when(pythonEvaluatorService.evaluate(eq(message.code().metric()), any()))
+                    .thenReturn(Mono.error(error));
+
+            assertThatThrownBy(() -> scorer.score(message).block()).isInstanceOf(RuntimeException.class);
+
+            verify(userFacingLogger).error(
+                    contains("Unexpected error while scoring traceId"),
+                    eq(traceId),
+                    eq(ruleName),
+                    eq("Python BE timeout"));
+            verify(feedbackScoreService, never()).scoreBatchOfTraces(any());
+        }
+    }
+
+    /**
+     * Every format string the user-facing sink received, in call order. Level checks such as
+     * {@code isInfoEnabled()} are recorded as zero-argument invocations and carry no message, so they are
+     * skipped rather than read as one.
+     */
+    private List<String> userFacingMessages() {
+        return mockingDetails(userFacingLogger).getInvocations().stream()
+                .filter(invocation -> invocation.getArguments().length > 0)
+                .map(invocation -> invocation.getArgument(0, String.class))
+                .toList();
+    }
+
+    private TraceToScoreUserDefinedMetricPython sampleMessage() {
+        return sampleMessageWithArguments(Map.of("input", "input.question", "output", "output.answer"));
+    }
+
+    private TraceToScoreUserDefinedMetricPython sampleMessageWithSpansArgument() {
+        return sampleMessageWithArguments(
+                Map.of("input", "input.question", "output", "output.answer", "spans", "spans"));
+    }
+
+    /**
+     * Mirrors the production shape: the metric declares `expects_sql` and `execution_plan`, the trace
+     * carries neither, so every declared argument resolves to null and the replacement map comes back
+     * empty.
+     */
+    private TraceToScoreUserDefinedMetricPython sampleMessageWithUnresolvableArguments() {
+        return sampleMessageWithArguments(
+                Map.of("expects_sql", "input.expects_sql", "plan", "output.execution_plan"));
+    }
+
+    private TraceToScoreUserDefinedMetricPython sampleMessageWithArguments(Map<String, String> arguments) {
+        // Pinned, not Podam-filled: the declared paths must actually resolve, or every test here hands the
+        // evaluator an empty map and silently stops covering what it means to.
+        var trace = podamFactory.manufacturePojo(Trace.class).toBuilder()
+                .id(traceId)
+                .projectId(projectId)
+                .input(JsonUtils.getJsonNodeFromString(
+                        "{\"question\":\"%s\"}".formatted(RandomStringUtils.secure().nextAlphanumeric(16))))
+                .output(JsonUtils.getJsonNodeFromString(
+                        "{\"answer\":\"%s\"}".formatted(RandomStringUtils.secure().nextAlphanumeric(16))))
+                .build();
+        return podamFactory.manufacturePojo(TraceToScoreUserDefinedMetricPython.class).toBuilder()
+                .trace(trace)
+                .ruleId(ruleId)
+                .ruleName(ruleName)
+                .code(new UserDefinedMetricPythonCode(
+                        "def score(input, output): return []",
+                        arguments))
+                .workspaceId(workspaceId)
+                .userName(userName)
+                .build();
+    }
+
+    private FeedbackScoreBatchItem traceScore(String name, BigDecimal value, String reason, Trace trace) {
+        return FeedbackScoreBatchItem.builder()
+                .id(trace.id())
+                .projectId(trace.projectId())
+                .projectName(trace.projectName())
+                .name(name)
+                .value(value)
+                .reason(reason)
+                .source(ScoreSource.ONLINE_SCORING)
+                .build();
+    }
+}

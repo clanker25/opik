@@ -1,0 +1,277 @@
+import pytest
+from typing import Any, Dict, Optional
+
+from opik.evaluation.metrics import score_result
+from opik.evaluation.scorers.scorer_function import validate_scorer_function
+from opik.message_processing.emulation import models
+
+
+def test_validate_scorer_function_valid_function():
+    """Test that a valid scorer function passes validation"""
+
+    def valid_scorer(
+        dataset_item: Dict[str, Any], task_outputs: Dict[str, Any]
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    # Should not raise any exception
+    validate_scorer_function(valid_scorer)
+
+
+def test_validate_scorer_function_valid_with_extra_params():
+    """Test that a function with required params plus extras passes validation"""
+
+    def valid_scorer_with_extras(
+        dataset_item: Dict[str, Any],
+        task_outputs: Dict[str, Any],
+        extra_param: str = "default",
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    # Should not raise any exception
+    validate_scorer_function(valid_scorer_with_extras)
+
+
+def test_validate_scorer_function_not_callable__raises_error():
+    """Test that non-callable objects raise ValueError"""
+    not_callable = "not a function"
+
+    with pytest.raises(
+        ValueError,
+        match="scorer_function must be a callable function",
+    ):
+        validate_scorer_function(not_callable)
+
+
+def test_validate_scorer_function_no_parameters__raises_error():
+    """Test that function with no parameters raises ValueError"""
+
+    def no_params():
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    with pytest.raises(
+        ValueError,
+        match="scorer_function must have either both 'dataset_item' and 'task_outputs' parameters or at least one 'task_span' parameter",
+    ):
+        validate_scorer_function(no_params)
+
+
+def test_validate_scorer_function_wrong_parameter_names__raises_error():
+    """Test that function with wrong parameter names raises ValueError"""
+
+    def wrong_names(input_data: Dict[str, Any], output_data: Dict[str, Any]):
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    with pytest.raises(
+        ValueError,
+        match="scorer_function must have either both 'dataset_item' and 'task_outputs' parameters or at least one 'task_span' parameter",
+    ):
+        validate_scorer_function(wrong_names)
+
+
+def test_validate_scorer_function_missing_dataset_item__raises_error():
+    """Test that function missing dataset_item parameter raises ValueError"""
+
+    def missing_dataset_item(task_outputs: Dict[str, Any], other_param: str):
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    with pytest.raises(
+        ValueError,
+        match="scorer_function must have either both 'dataset_item' and 'task_outputs' parameters or at least one 'task_span' parameter",
+    ):
+        validate_scorer_function(missing_dataset_item)
+
+
+def test_validate_scorer_function_missing_task_outputs__raises_error():
+    """Test that function missing task_outputs parameter raises ValueError"""
+
+    def missing_task_outputs(dataset_item: Dict[str, Any], other_param: str):
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    with pytest.raises(
+        ValueError,
+        match="scorer_function must have either both 'dataset_item' and 'task_outputs' parameters or at least one 'task_span' parameter",
+    ):
+        validate_scorer_function(missing_task_outputs)
+
+
+def test_validate_scorer_function_with_kwargs():
+    """Test that function with **kwargs passes validation"""
+
+    def scorer_with_kwargs(
+        dataset_item: Dict[str, Any], task_outputs: Dict[str, Any], **kwargs
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    # Should not raise any exception
+    validate_scorer_function(scorer_with_kwargs)
+
+
+def test_validate_scorer_function_with_args_and_kwargs():
+    """Test that function with *args and **kwargs passes validation"""
+
+    def scorer_with_args_kwargs(
+        dataset_item: Dict[str, Any], task_outputs: Dict[str, Any], *args, **kwargs
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    # Should not raise any exception
+    validate_scorer_function(scorer_with_args_kwargs)
+
+
+def test_validate_scorer_function_with_task_span_only():
+    """Test that function with only the task_span parameter passes validation"""
+
+    def scorer_with_task_span_only(
+        task_span: Optional[models.SpanModel],
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    # Should not raise any exception
+    validate_scorer_function(scorer_with_task_span_only)
+
+
+def test_validate_scorer_function_with_task_span_and_other_params():
+    """Test that function with task_span and other parameters passes validation"""
+
+    def scorer_with_task_span_and_extras(
+        task_span: Optional[models.SpanModel],
+        extra_param: str = "default",
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    # Should not raise any exception
+    validate_scorer_function(scorer_with_task_span_and_extras)
+
+
+def test_validate_scorer_function_with_all_params():
+    """Test that function with all parameters (dataset_item, task_outputs, task_span) passes validation"""
+
+    def scorer_with_all_params(
+        dataset_item: Dict[str, Any],
+        task_outputs: Dict[str, Any],
+        task_span: Optional[models.SpanModel] = None,
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(name="test", value=1.0)
+
+    # Should not raise any exception
+    validate_scorer_function(scorer_with_all_params)
+
+
+def test_wrap_scorer_functions__partial_and_callable_object__named_and_scored():
+    # Both are accepted by validate_scorer_function but have no __name__, which
+    # used to raise AttributeError while wrapping.
+    import functools
+
+    from opik.evaluation.scorers.scorer_wrapper_metric import wrap_scorer_functions
+
+    def length_above(
+        dataset_item: Dict[str, Any], task_outputs: Dict[str, Any], threshold: int
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(
+            name="length_above", value=float(len(task_outputs) > threshold)
+        )
+
+    class ExactMatch:
+        def __call__(
+            self, dataset_item: Dict[str, Any], task_outputs: Dict[str, Any]
+        ) -> score_result.ScoreResult:
+            return score_result.ScoreResult(name="exact_match", value=1.0)
+
+    metrics = wrap_scorer_functions(
+        [functools.partial(length_above, threshold=0), ExactMatch()],
+        project_name=None,
+    )
+
+    assert [metric.name for metric in metrics] == ["length_above", "ExactMatch"]
+    for metric in metrics:
+        result = metric.score(dataset_item={}, task_outputs={"output": "x"})
+        assert result.value == 1.0
+
+
+def test_wrap_scorer_functions__non_string_name_attribute__falls_back_to_class_name():
+    from opik.evaluation.scorers.scorer_wrapper_metric import wrap_scorer_functions
+
+    class OddlyNamed:
+        __name__ = 123
+
+        def __call__(
+            self, dataset_item: Dict[str, Any], task_outputs: Dict[str, Any]
+        ) -> score_result.ScoreResult:
+            return score_result.ScoreResult(name="odd", value=1.0)
+
+    [metric] = wrap_scorer_functions([OddlyNamed()], project_name=None)
+
+    assert metric.name == "OddlyNamed"
+
+
+def _task_span() -> models.SpanModel:
+    import datetime
+
+    return models.SpanModel(
+        id="span-id", start_time=datetime.datetime.now(), source="sdk"
+    )
+
+
+@pytest.mark.parametrize("task_span", [None, _task_span()], ids=["no-span", "span"])
+def test_wrap_scorer_functions__task_span_only_scorer__called_without_unknown_kwargs(
+    task_span,
+):
+    from opik.evaluation.scorers.scorer_wrapper_metric import wrap_scorer_functions
+
+    def spans_are_present(
+        task_span: Optional[models.SpanModel] = None,
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(
+            name="spans_are_present", value=1.0 if task_span else 0.0
+        )
+
+    [metric] = wrap_scorer_functions([spans_are_present], project_name=None)
+
+    result = metric.score(
+        dataset_item={"input": "hi"},
+        task_outputs={"output": "hello"},
+        task_span=task_span,
+    )
+
+    assert result.value == (1.0 if task_span else 0.0)
+
+
+def test_wrap_scorer_functions__scorer_with_var_kwargs__receives_all_arguments():
+    from opik.evaluation.scorers.scorer_wrapper_metric import wrap_scorer_functions
+
+    received: Dict[str, Any] = {}
+
+    def scorer(task_span=None, **kwargs) -> score_result.ScoreResult:
+        received.update(kwargs, task_span=task_span)
+        return score_result.ScoreResult(name="scorer", value=1.0)
+
+    [metric] = wrap_scorer_functions([scorer], project_name=None)
+    span = _task_span()
+
+    metric.score(dataset_item={"a": 1}, task_outputs={"b": 2}, task_span=span)
+
+    assert received == {
+        "dataset_item": {"a": 1},
+        "task_outputs": {"b": 2},
+        "task_span": span,
+    }
+
+
+def test_wrap_scorer_functions__required_task_span_and_no_span__called_with_none():
+    from opik.evaluation.scorers.scorer_wrapper_metric import wrap_scorer_functions
+
+    def spans_are_present(
+        task_span: Optional[models.SpanModel],
+    ) -> score_result.ScoreResult:
+        return score_result.ScoreResult(
+            name="spans_are_present", value=1.0 if task_span else 0.0
+        )
+
+    [metric] = wrap_scorer_functions([spans_are_present], project_name=None)
+
+    result = metric.score(
+        dataset_item={"input": "hi"}, task_outputs={"output": "hello"}
+    )
+
+    assert result.value == 0.0

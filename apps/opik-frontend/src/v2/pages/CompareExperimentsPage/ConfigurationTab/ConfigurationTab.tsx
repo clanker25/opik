@@ -1,0 +1,254 @@
+import React, { useMemo } from "react";
+import { BooleanParam, StringParam, useQueryParam } from "use-query-params";
+import { ColumnPinningState } from "@tanstack/react-table";
+import useLocalStorageState from "use-local-storage-state";
+import isObject from "lodash/isObject";
+import isUndefined from "lodash/isUndefined";
+import uniq from "lodash/uniq";
+import toLower from "lodash/toLower";
+import find from "lodash/find";
+import { flattie } from "flattie";
+
+import { COLUMN_TYPE, ColumnData } from "@/types/shared";
+import DataTable from "@/shared/DataTable/DataTable";
+import DataTableNoData from "@/shared/DataTableNoData/DataTableNoData";
+import CompareExperimentsHeader from "@/v2/pages-shared/experiments/CompareExperimentsHeader/CompareExperimentsHeader";
+import CompareExperimentsActionsPanel from "@/v2/pages/CompareExperimentsPage/CompareExperimentsActionsPanel";
+import CompareExperimentsConfigCell, {
+  CompareConfig,
+  CompareFiledValue,
+} from "@/v2/pages-shared/experiments/CompareExperimentsConfigCell/CompareExperimentsConfigCell";
+import PageBodyStickyContainer from "@/shared/PageBodyStickyContainer/PageBodyStickyContainer";
+import PageBodyStickyTableWrapper from "@/v2/layout/PageBodyStickyTableWrapper/PageBodyStickyTableWrapper";
+import { convertColumnDataToColumn } from "@/lib/table";
+import SearchInput from "@/shared/SearchInput/SearchInput";
+import { Experiment } from "@/types/datasets";
+import {
+  formatExperimentPromptVersions,
+  sortPromptVersions,
+} from "@/lib/experiments";
+import { Switch } from "@/ui/switch";
+import { Label } from "@/ui/label";
+import { Separator } from "@/ui/separator";
+
+const COLUMNS_WIDTH_KEY = "compare-experiments-config-columns-width";
+
+// Suffixed so it can't collide with a user metadata key named "Prompt version".
+const PROMPT_VERSION_ROW_NAME = "Prompt version (linked)";
+
+export const DEFAULT_COLUMN_PINNING: ColumnPinningState = {
+  left: ["name"],
+  right: [],
+};
+
+export const DEFAULT_COLUMNS: ColumnData<CompareConfig>[] = [
+  {
+    id: "name",
+    label: "Name",
+    type: COLUMN_TYPE.string,
+  },
+];
+
+export type ConfigurationTabProps = {
+  experimentsIds: string[];
+  experiments: Experiment[];
+  isPending: boolean;
+};
+
+const ConfigurationTab: React.FunctionComponent<ConfigurationTabProps> = ({
+  experimentsIds,
+  experiments,
+  isPending,
+}) => {
+  const [search = "", setSearch] = useQueryParam("searchConfig", StringParam, {
+    updateType: "replaceIn",
+  });
+
+  const [onlyDiff = false, setOnlyDiff] = useQueryParam("diff", BooleanParam, {
+    updateType: "replaceIn",
+  });
+
+  const isCompare = experimentsIds.length > 1;
+
+  const [columnsWidth, setColumnsWidth] = useLocalStorageState<
+    Record<string, number>
+  >(COLUMNS_WIDTH_KEY, {
+    defaultValue: {},
+  });
+
+  const columns = useMemo(() => {
+    const retVal = convertColumnDataToColumn<CompareConfig, CompareConfig>(
+      DEFAULT_COLUMNS,
+      {},
+    );
+
+    experimentsIds.forEach((id: string) => {
+      retVal.push({
+        accessorKey: id,
+        header: CompareExperimentsHeader as never,
+        cell: CompareExperimentsConfigCell as never,
+        meta: {
+          custom: {
+            onlyDiff,
+            experiment: find(experiments, (e) => e.id === id),
+          },
+        },
+        size: 400,
+        minSize: 120,
+      });
+    });
+
+    return retVal;
+  }, [experimentsIds, onlyDiff, experiments]);
+
+  const flattenExperimentMetadataMap = useMemo(() => {
+    return experiments.reduce<
+      Record<string, Record<string, CompareFiledValue>>
+    >((acc, experiment) => {
+      const metadata = experiment.metadata;
+      acc[experiment.id] = isObject(metadata)
+        ? flattie(metadata, ".", true)
+        : {};
+      return acc;
+    }, {});
+  }, [experiments]);
+
+  const promptVersionRow = useMemo(() => {
+    if (!isCompare) return null;
+
+    const data: Record<string, CompareFiledValue> = {};
+    const promptVersionsByExperimentId: CompareConfig["promptVersionsByExperimentId"] =
+      {};
+
+    experimentsIds.forEach((id: string) => {
+      const experiment = find(experiments, (e) => e.id === id);
+      data[id] = formatExperimentPromptVersions(experiment);
+      promptVersionsByExperimentId[id] = experiment?.prompt_versions?.length
+        ? sortPromptVersions(experiment.prompt_versions)
+        : undefined;
+    });
+
+    if (Object.values(data).every(isUndefined)) return null;
+
+    // Labels can collide (prompt names are only unique per project, and every
+    // deleted prompt reads the same), so diff on the versions themselves.
+    const versionKeys = experimentsIds.map(
+      (id) => promptVersionsByExperimentId[id]?.map((pv) => pv.id).join(),
+    );
+
+    return {
+      name: PROMPT_VERSION_ROW_NAME,
+      base: experimentsIds[0],
+      data,
+      promptVersionsByExperimentId,
+      different: !versionKeys.every((key) => key === versionKeys[0]),
+    } as CompareConfig;
+  }, [isCompare, experimentsIds, experiments]);
+
+  const rows = useMemo(() => {
+    const keys = uniq(
+      Object.values(flattenExperimentMetadataMap).reduce<string[]>(
+        (acc, map) => acc.concat(Object.keys(map)),
+        [],
+      ),
+    ).sort();
+
+    return keys.map((key) => {
+      const data = experimentsIds.reduce<Record<string, CompareFiledValue>>(
+        (acc, id: string) => {
+          acc[id] = flattenExperimentMetadataMap[id]?.[key] ?? undefined;
+          return acc;
+        },
+        {},
+      );
+      const values = Object.values(data);
+
+      return {
+        name: key,
+        base: experimentsIds[0],
+        data,
+        different: !values.every((v) => values[0] === v),
+      } as CompareConfig;
+    });
+  }, [flattenExperimentMetadataMap, experimentsIds]);
+
+  const filteredRows = useMemo(() => {
+    const allRows = promptVersionRow ? [promptVersionRow, ...rows] : rows;
+
+    return allRows.filter((row) => {
+      if (isCompare && onlyDiff && !row.different) {
+        return false;
+      }
+
+      return !(search && !toLower(row.name).includes(toLower(search)));
+    });
+  }, [rows, promptVersionRow, search, onlyDiff, isCompare]);
+
+  const noDataText = search
+    ? "No search results"
+    : isCompare
+      ? "These experiments have no configuration"
+      : "This experiment has no configuration";
+
+  const resizeConfig = useMemo(
+    () => ({
+      enabled: true,
+      columnSizing: columnsWidth,
+      onColumnResize: setColumnsWidth,
+    }),
+    [columnsWidth, setColumnsWidth],
+  );
+
+  const isTableLoading = isPending;
+
+  return (
+    <>
+      <PageBodyStickyContainer
+        className="-mt-4 flex flex-wrap items-center justify-between gap-x-8 gap-y-2 py-4"
+        direction="bidirectional"
+        limitWidth
+      >
+        <SearchInput
+          searchText={search as string}
+          setSearchText={setSearch}
+          placeholder="Search by name"
+          className="w-[200px] shrink-0"
+          dimension="xs"
+        ></SearchInput>
+        <div className="flex items-center gap-2">
+          <CompareExperimentsActionsPanel />
+          {isCompare && (
+            <>
+              <Separator orientation="vertical" className="mx-2 h-4" />
+              <div className="flex items-center space-x-2">
+                <Label htmlFor="show-doff-only">Show differences only</Label>
+                <Switch
+                  id="show-doff-only"
+                  onCheckedChange={setOnlyDiff}
+                  checked={onlyDiff as boolean}
+                />
+              </div>
+            </>
+          )}
+        </div>
+      </PageBodyStickyContainer>
+      <DataTable
+        columns={columns}
+        data={filteredRows}
+        resizeConfig={resizeConfig}
+        columnPinning={DEFAULT_COLUMN_PINNING}
+        noData={<DataTableNoData title={noDataText} />}
+        TableWrapper={PageBodyStickyTableWrapper}
+        stickyHeader
+        showSkeleton={isTableLoading}
+      />
+      <PageBodyStickyContainer
+        className="pb-6"
+        direction="horizontal"
+        limitWidth
+      />
+    </>
+  );
+};
+
+export default ConfigurationTab;
